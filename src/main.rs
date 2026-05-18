@@ -132,6 +132,21 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
                 eprintln!("本地目录不存在: {}", new_path);
             }
         }
+        "put" => {
+            if parts.len() < 2 {
+                eprintln!("用法: put <本地文件> [远程文件名]");
+                return;
+            }
+            let local_path = resolve_local_path(client.get_current_local_path(), parts[1]);
+            let remote_filename = if parts.len() > 2 { Some(parts[2]) } else { None };
+            if let Err(e) = client.upload_file(&local_path, remote_filename).await {
+                eprintln!("上传失败: {}", e);
+            }
+        }
+        "exit" | "quit" | "bye" => {
+            println!("bye");
+            std::process::exit(0);
+        }
         _ => {
             println!("未知命令: {}", command);
         }
@@ -295,6 +310,19 @@ fn simplify_path(path: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", stack.join("/"))
+    }
+}
+
+/// 解析本地文件路径（支持相对路径和绝对路径）
+fn resolve_local_path(current_local_path: &str, target: &str) -> String {
+    if target.starts_with('/') {
+        target.to_string()
+    } else {
+        if current_local_path.ends_with('/') {
+            format!("{}{}", current_local_path, target)
+        } else {
+            format!("{}/{}", current_local_path, target)
+        }
     }
 }
 

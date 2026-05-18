@@ -6,7 +6,8 @@ use std::{
     collections::HashMap,
     fs::File,
     hash::Hash,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::Path,
     str, string,
 };
 use serde_json::Value;
@@ -261,6 +262,57 @@ pub struct ManageFileResponse {
     #[serde(flatten)]
     pub base: BaiduApiErrNoResponse,
 }
+
+/// 预上传响应
+#[derive(Debug, Deserialize)]
+pub struct PrecreateResponse {
+    #[serde(flatten)]
+    pub base: BaiduApiErrNoResponse,
+    pub path: Option<String>,
+    pub uploadid: Option<String>,
+    pub return_type: Option<i32>,
+    pub block_list: Option<Vec<i32>>,
+    pub request_id: Option<u64>,
+}
+
+/// 获取上传域名 - 服务器信息
+#[derive(Debug, Deserialize)]
+pub struct ServerInfo {
+    pub server: String,
+}
+
+/// 获取上传域名响应
+#[derive(Debug, Deserialize)]
+pub struct LocateUploadResponse {
+    pub error_code: i32,
+    pub error_msg: Option<String>,
+    pub servers: Option<Vec<ServerInfo>>,
+    pub request_id: Option<u64>,
+}
+
+/// 分片上传响应
+#[derive(Debug, Deserialize)]
+pub struct UploadChunkResponse {
+    pub errno: Option<i32>,
+    pub md5: Option<String>,
+    pub request_id: Option<u64>,
+}
+
+/// 创建文件响应
+#[derive(Debug, Deserialize)]
+pub struct CreateFileResponse {
+    #[serde(flatten)]
+    pub base: BaiduApiErrNoResponse,
+    pub fs_id: Option<u64>,
+    pub md5: Option<String>,
+    pub server_filename: Option<String>,
+    pub category: Option<i32>,
+    pub path: Option<String>,
+    pub size: Option<u64>,
+    pub ctime: Option<u64>,
+    pub mtime: Option<u64>,
+    pub isdir: Option<i32>,
+}
 /// 百度网盘API客户端
 pub struct BaiduApiClient {
     client: Client,
@@ -332,6 +384,193 @@ impl BaiduApiClient {
     /// 设置当前本地路径
     pub fn set_current_local_path(&mut self, path: String) {
         self.current_local_path = path;
+    }
+
+    /// 预上传 - 通知网盘新建上传任务
+    pub async fn precreate(&self, path: &str, size: u64, block_list: &str) -> anyhow::Result<PrecreateResponse> {
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=precreate&access_token={}",
+            self.access_token
+        );
+        let body = format!(
+            "path={}&size={}&isdir=0&block_list={}&autoinit=1&rtype=1",
+            urlencoding::encode(path),
+            size,
+            urlencoding::encode(block_list),
+        );
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send().await?;
+        let result: PrecreateResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("预上传失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
+        }
+        Ok(result)
+    }
+
+    /// 获取上传域名
+    pub async fn locate_upload(&self, path: &str, uploadid: &str) -> anyhow::Result<String> {
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locateupload&appid=250528&access_token={}&path={}&uploadid={}&upload_version=2.0",
+            self.access_token, encoded_path, uploadid
+        );
+        let response = self.client.get(&url).send().await?;
+        let result: LocateUploadResponse = response.json().await?;
+        if result.error_code != 0 {
+            return Err(anyhow!("获取上传域名失败: error_code={}, error_msg={:?}", result.error_code, result.error_msg));
+        }
+        if let Some(servers) = &result.servers {
+            for s in servers {
+                if s.server.starts_with("https://") {
+                    return Ok(s.server.clone());
+                }
+            }
+            if let Some(first) = servers.first() {
+                return Ok(first.server.clone());
+            }
+        }
+        Err(anyhow!("未获取到可用的上传域名"))
+    }
+
+    /// 分片上传
+    pub async fn upload_chunk(
+        &self,
+        domain: &str,
+        path: &str,
+        uploadid: &str,
+        partseq: i32,
+        data: Vec<u8>,
+    ) -> anyhow::Result<String> {
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "{}/rest/2.0/pcs/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
+            domain, self.access_token, encoded_path, uploadid, partseq
+        );
+
+        // 手动构造 multipart/form-data body
+        let boundary = "bftp_upload_boundary";
+        let mut body: Vec<u8> = Vec::new();
+        write!(body, "--{}\r\n", boundary)?;
+        write!(body, "Content-Disposition: form-data; name=\"file\"; filename=\"blob\"\r\n")?;
+        write!(body, "Content-Type: application/octet-stream\r\n\r\n")?;
+        body.extend_from_slice(&data);
+        write!(body, "\r\n--{}--\r\n", boundary)?;
+
+        let content_type = format!("multipart/form-data; boundary={}", boundary);
+        let response = self.client.post(&url)
+            .header("Content-Type", &content_type)
+            .body(body)
+            .send()
+            .await?;
+        let status = response.status();
+        let body_text = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "分片上传HTTP错误: status={}, body={}",
+                status,
+                body_text
+            ));
+        }
+        let result: UploadChunkResponse = serde_json::from_str(&body_text)
+            .map_err(|e| anyhow!("解析分片上传响应失败: {}, body={}", e, body_text))?;
+        if let Some(errno) = result.errno {
+            if errno != 0 {
+                return Err(anyhow!("分片上传失败: errno={}, body={}", errno, body_text));
+            }
+        }
+        Ok(result.md5.unwrap_or_default())
+    }
+
+    /// 创建文件 - 合并分片完成上传
+    pub async fn create_file(
+        &self,
+        path: &str,
+        size: u64,
+        block_list: &str,
+        uploadid: &str,
+    ) -> anyhow::Result<CreateFileResponse> {
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=create&access_token={}",
+            self.access_token
+        );
+        let body = format!(
+            "path={}&size={}&isdir=0&block_list={}&uploadid={}&rtype=1",
+            urlencoding::encode(path),
+            size,
+            urlencoding::encode(block_list),
+            urlencoding::encode(uploadid),
+        );
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send().await?;
+        let result: CreateFileResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("创建文件失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
+        }
+        Ok(result)
+    }
+
+    /// 上传单个文件到远程当前目录
+    pub async fn upload_file(&self, local_path: &str, remote_filename: Option<&str>) -> anyhow::Result<()> {
+        let local_file_path = Path::new(local_path);
+        if !local_file_path.exists() {
+            return Err(anyhow!("本地文件不存在: {}", local_path));
+        }
+        if !local_file_path.is_file() {
+            return Err(anyhow!("不是一个文件: {}", local_path));
+        }
+
+        let filename = remote_filename.unwrap_or_else(|| {
+            local_file_path.file_name().unwrap().to_str().unwrap()
+        });
+
+        let remote_path = if self.current_remote_path.ends_with('/') {
+            format!("{}{}", self.current_remote_path, filename)
+        } else {
+            format!("{}/{}", self.current_remote_path, filename)
+        };
+
+        println!("上传文件: {} -> {}", local_path, remote_path);
+
+        // 1. 计算 block_list
+        let (file_size, block_list, chunk_count) = compute_block_list(local_path)?;
+        println!("文件大小: {}, 分片数: {}", format_size(file_size), chunk_count);
+
+        // 2. 预上传
+        println!("[1/3] 预上传...");
+        let precreate_result = self.precreate(&remote_path, file_size, &block_list).await?;
+        let uploadid = precreate_result.uploadid.context("预上传未返回uploadid")?;
+        let chunks_to_upload = precreate_result.block_list.unwrap_or_else(|| vec![0]);
+        println!("uploadid: {}", uploadid);
+
+        // 3. 获取上传域名
+        println!("[2/3] 获取上传域名...");
+        let domain = self.locate_upload(&remote_path, &uploadid).await?;
+        println!("上传域名: {}", domain);
+
+        // 4. 分片上传
+        let total_chunks = chunks_to_upload.len();
+        for (i, &chunk_idx) in chunks_to_upload.iter().enumerate() {
+            let progress = format!("{}/{}", i + 1, total_chunks);
+            println!("[2/3] 上传分片 {} (index={})...", progress, chunk_idx);
+            let chunk_data = read_chunk(local_path, chunk_idx as usize)?;
+            let chunk_md5 = self.upload_chunk(&domain, &remote_path, &uploadid, chunk_idx, chunk_data).await?;
+            println!("  分片 {} md5: {}", chunk_idx, chunk_md5);
+        }
+
+        // 5. 创建文件
+        println!("[3/3] 创建文件...");
+        let result = self.create_file(&remote_path, file_size, &block_list, &uploadid).await?;
+        println!("上传成功!");
+        println!("  文件名: {}", result.server_filename.as_deref().unwrap_or(filename));
+        println!("  路径: {}", result.path.as_deref().unwrap_or(&remote_path));
+        println!("  大小: {}", format_size(result.size.unwrap_or(file_size)));
+        println!("  fs_id: {}", result.fs_id.unwrap_or(0));
+
+        Ok(())
     }
 }
 
@@ -526,4 +765,49 @@ fn format_timestamp(timestamp: u64) -> String {
 
 fn is_leap_year(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+// ==================== 上传辅助函数 ====================
+
+/// 计算数据的MD5
+fn compute_file_md5(data: &[u8]) -> String {
+    format!("{:x}", md5::compute(data))
+}
+
+/// 计算文件的 block_list（每个4MB分片的MD5数组的JSON字符串），返回 (文件大小, block_list_json)
+fn compute_block_list(file_path: &str) -> anyhow::Result<(u64, String, usize)> {
+    let mut file = File::open(file_path)?;
+    let file_size = file.metadata()?.len();
+
+    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB
+    let mut md5s: Vec<String> = Vec::new();
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        md5s.push(compute_file_md5(&buffer[..bytes_read]));
+    }
+
+    // 空文件发送一个空的MD5
+    if md5s.is_empty() {
+        md5s.push(compute_file_md5(&[]));
+    }
+
+    let block_list_str = serde_json::to_string(&md5s)?;
+    Ok((file_size, block_list_str, md5s.len()))
+}
+
+/// 读取文件的指定分片（0-indexed，每片4MB）
+fn read_chunk(file_path: &str, chunk_index: usize) -> anyhow::Result<Vec<u8>> {
+    let mut file = File::open(file_path)?;
+    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
+    let offset = chunk_index as u64 * CHUNK_SIZE;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buffer = vec![0u8; CHUNK_SIZE as usize];
+    let bytes_read = file.read(&mut buffer)?;
+    buffer.truncate(bytes_read);
+    Ok(buffer)
 }

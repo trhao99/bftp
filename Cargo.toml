@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 regex = "1.12.3"
-reqwest = { version = "0.13.3", features = ["json"] }
+md5 = "0.7.0"
+reqwest = { version = "0.13.3", features = ["json", "multipart"] }
 rustyline = "18.0.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_repr = "0.1.20"
