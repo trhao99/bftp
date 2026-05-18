@@ -192,17 +192,17 @@ pub struct FileMeta {
     // 文件大小，单位字节
     pub size: i32,
     // 缩略图地址，包含四种分辨率。详细尺寸参考响应示例
-    pub thumbs: HashMap<String, String>,
+    pub thumbs: Option<HashMap<String, String>>,
     // 图片高度
-    pub height: i32,
+    pub height: Option<i32>,
     // 图片宽度
-    pub width: i32,
+    pub width: Option<i32>,
     // 图片拍摄时间
-    pub date_taken: i32,
+    pub date_taken: Option<i32>,
     // 图片旋转方向信息
-    pub orientation: String,
+    pub orientation: Option<String>,
     // 视频信息。
-    pub media_info: HashMap<String, String>,
+    pub media_info: Option<HashMap<String, String>>,
 }
 /// 下载链接响应
 #[derive(Debug, Deserialize)]
@@ -649,6 +649,150 @@ impl BaiduApiClient {
     pub async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
         let filelist = serde_json::to_string(&[path])?;
         self.filemanager("delete", &filelist).await?;
+        Ok(())
+    }
+
+    /// 列出指定目录的文件
+    pub async fn list_files_in_dir(&self, dir: &str) -> anyhow::Result<FileListResponse> {
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=list&access_token={}&dir={}",
+            self.access_token, dir
+        );
+        let response = self.client.get(&url).send().await?;
+        let result: FileListResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("列出文件失败: errno={}", result.base.errno));
+        }
+        Ok(result)
+    }
+
+    /// 获取文件元信息（含下载链接 dlink）
+    pub async fn get_file_metas(&self, fsids: &[u64]) -> anyhow::Result<QueryFileInfoResponse> {
+        let fsids_json = serde_json::to_string(fsids)?;
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&access_token={}&fsids={}&dlink=1",
+            self.access_token, fsids_json
+        );
+        let response = self.client.get(&url).send().await?;
+        let result: QueryFileInfoResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("获取文件元信息失败: errno={}", result.base.errno));
+        }
+        if result.list.is_empty() {
+            return Err(anyhow!("未获取到文件元信息"));
+        }
+        Ok(result)
+    }
+
+    /// 递归获取目录下所有文件（支持分页）
+    pub async fn recursive_list(&self, path: &str) -> anyhow::Result<Vec<FileInfo>> {
+        let encoded_path = urlencoding::encode(path);
+        let mut all_files: Vec<FileInfo> = Vec::new();
+        let mut cursor = 0i32;
+
+        loop {
+            let url = format!(
+                "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=listall&access_token={}&path={}&recursion=1&start={}&limit=1000",
+                self.access_token, encoded_path, cursor
+            );
+            let response = self.client.get(&url).send().await?;
+            let result: CategoryFileListResponse = response.json().await?;
+            if result.base.errno != 0 {
+                return Err(anyhow!("递归列出文件失败: errno={}", result.base.errno));
+            }
+            if let Some(list) = result.list {
+                all_files.extend(list);
+            }
+            if result.has_more == 0 {
+                break;
+            }
+            cursor = result.cursor;
+        }
+
+        Ok(all_files)
+    }
+
+    /// 通过 dlink 下载文件到本地
+    pub async fn download_from_url(&self, dlink: &str, local_path: &str) -> anyhow::Result<u64> {
+        let url = format!("{}&access_token={}", dlink, self.access_token);
+        let response = self.client.get(&url)
+            .header("User-Agent", "pan.baidu.com")
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await?;
+            return Err(anyhow!("下载HTTP错误: status={}, body={}", status, body));
+        }
+        let bytes = response.bytes().await?;
+        let size = bytes.len() as u64;
+        if let Some(parent) = Path::new(local_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(local_path)?;
+        file.write_all(&bytes)?;
+        Ok(size)
+    }
+
+    /// 下载单个远程文件（通过路径查找 fs_id → dlink → 下载）
+    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> anyhow::Result<()> {
+        let p = Path::new(remote_path);
+        let parent_dir = p.parent().and_then(|x| x.to_str()).unwrap_or("/");
+        let filename = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+
+        // 列出父目录，查找文件 fs_id
+        let file_list = self.list_files_in_dir(parent_dir).await?;
+        let file_info = file_list.list.as_ref()
+            .and_then(|files| files.iter().find(|f| f.server_filename == filename))
+            .ok_or_else(|| anyhow!("未找到远程文件: {}", remote_path))?;
+
+        if file_info.isdir == 1 {
+            return Err(anyhow!("{} 是目录，请使用 get -r <目录> 下载", remote_path));
+        }
+
+        // 获取 dlink 并下载
+        let metas = self.get_file_metas(&[file_info.fs_id]).await?;
+        let file_meta = metas.list.first()
+            .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+        let dlink = &file_meta.dlink;
+
+        let size = self.download_from_url(dlink, local_path).await?;
+        println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(size));
+        Ok(())
+    }
+
+    /// 递归下载远程目录
+    pub async fn download_dir(&self, remote_dir: &str, local_dir: &str) -> anyhow::Result<()> {
+        let all_entries = self.recursive_list(remote_dir).await?;
+        let files: Vec<_> = all_entries.iter().filter(|f| f.isdir == 0).collect();
+
+        if files.is_empty() {
+            println!("目录为空，没有文件可下载");
+            return Ok(());
+        }
+
+        println!("共 {} 个文件待下载", files.len());
+
+        for (i, file_info) in files.iter().enumerate() {
+            // 将远程路径映射到本地路径
+            let rel_path = file_info.path.strip_prefix(remote_dir)
+                .unwrap_or(&file_info.path);
+            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+            let local_file_path = Path::new(local_dir).join(rel_path);
+
+            println!("[{}/{}] 下载: {} -> {}",
+                i + 1, files.len(),
+                file_info.path,
+                local_file_path.display()
+            );
+
+            let metas = self.get_file_metas(&[file_info.fs_id]).await?;
+            let file_meta = metas.list.first()
+                .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+            self.download_from_url(&file_meta.dlink, local_file_path.to_str().unwrap()).await?;
+        }
+
+        println!("下载完成: {} 个文件", files.len());
         Ok(())
     }
 }

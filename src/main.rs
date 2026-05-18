@@ -143,6 +143,46 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
                 eprintln!("上传失败: {}", e);
             }
         }
+        "get" => {
+            if parts.len() < 2 {
+                eprintln!("用法: get [-r] <远程文件> [本地路径]");
+                return;
+            }
+            // get -r remotedir [localdir]
+            if parts[1] == "-r" {
+                if parts.len() < 3 {
+                    eprintln!("用法: get -r <远程目录> [本地目录]");
+                    return;
+                }
+                let remote_dir = normalize_remote_path(client.get_current_remote_path(), parts[2]);
+                let local_dir = if parts.len() > 3 {
+                    resolve_local_path(client.get_current_local_path(), parts[3])
+                } else {
+                    let dirname = Path::new(&remote_dir)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("download");
+                    resolve_local_path(client.get_current_local_path(), dirname)
+                };
+                if let Err(e) = client.download_dir(&remote_dir, &local_dir).await {
+                    eprintln!("下载失败: {}", e);
+                }
+            } else {
+                let remote_path = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+                let local_path = if parts.len() > 2 {
+                    resolve_local_path(client.get_current_local_path(), parts[2])
+                } else {
+                    let filename = Path::new(&remote_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("download");
+                    resolve_local_path(client.get_current_local_path(), filename)
+                };
+                if let Err(e) = client.download_file(&remote_path, &local_path).await {
+                    eprintln!("下载失败: {}", e);
+                }
+            }
+        }
         "rename" => {
             if parts.len() < 3 {
                 eprintln!("用法: rename <远程文件> <新文件名>");
