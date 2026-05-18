@@ -558,10 +558,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     // 处理命令行参数，获取 token
-    let (mut config, token, username) = handle_command_line_args(config, &args);
-    println!("token:{}", token);
+    let (mut config, _token, username) = handle_command_line_args(config, &args);
     let token = ensure_valid_token(&mut config, &username).await?;
-    println!("token:{}", token);
 
     let mut client = BaiduApiClient::new(token);
     let userinfo = client.get_user_info().await?;
