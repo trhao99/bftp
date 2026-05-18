@@ -263,6 +263,23 @@ pub struct ManageFileResponse {
     pub base: BaiduApiErrNoResponse,
 }
 
+/// 文件管理响应
+#[derive(Debug, Deserialize)]
+pub struct FileManagerResponse {
+    #[serde(flatten)]
+    pub base: BaiduApiErrNoResponse,
+    pub info: Option<Vec<FileManagerItem>>,
+    pub taskid: Option<u64>,
+    pub request_id: Option<u64>,
+}
+
+/// 文件管理结果项
+#[derive(Debug, Deserialize)]
+pub struct FileManagerItem {
+    pub errno: i32,
+    pub path: Option<String>,
+}
+
 /// 预上传响应
 #[derive(Debug, Deserialize)]
 pub struct PrecreateResponse {
@@ -570,6 +587,68 @@ impl BaiduApiClient {
         println!("  大小: {}", format_size(result.size.unwrap_or(file_size)));
         println!("  fs_id: {}", result.fs_id.unwrap_or(0));
 
+        Ok(())
+    }
+
+    /// 文件管理通用接口
+    pub async fn filemanager(&self, opera: &str, filelist: &str) -> anyhow::Result<FileManagerResponse> {
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=filemanager&access_token={}&opera={}&async=0",
+            self.access_token, opera
+        );
+        let body = format!("filelist={}", urlencoding::encode(filelist));
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?;
+        let result: FileManagerResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!(
+                "文件操作失败: errno={}, errmsg={:?}",
+                result.base.errno,
+                result.base.errmsg
+            ));
+        }
+        if let Some(ref info) = result.info {
+            for item in info {
+                if item.errno != 0 {
+                    return Err(anyhow!(
+                        "文件 {} 操作失败: errno={}",
+                        item.path.as_deref().unwrap_or("?"),
+                        item.errno
+                    ));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// 重命名远程文件
+    pub async fn rename_file(&self, path: &str, newname: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[serde_json::json!({
+            "path": path,
+            "newname": newname
+        })])?;
+        self.filemanager("rename", &filelist).await?;
+        Ok(())
+    }
+
+    /// 复制远程文件
+    pub async fn copy_file(&self, path: &str, dest: &str, newname: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[serde_json::json!({
+            "path": path,
+            "dest": dest,
+            "newname": newname
+        })])?;
+        self.filemanager("copy", &filelist).await?;
+        Ok(())
+    }
+
+    /// 删除远程文件
+    pub async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[path])?;
+        self.filemanager("delete", &filelist).await?;
         Ok(())
     }
 }

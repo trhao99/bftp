@@ -143,6 +143,180 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
                 eprintln!("上传失败: {}", e);
             }
         }
+        "rename" => {
+            if parts.len() < 3 {
+                eprintln!("用法: rename <远程文件> <新文件名>");
+                return;
+            }
+            let path = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            let newname = parts[2];
+            if let Err(e) = client.rename_file(&path, newname).await {
+                eprintln!("重命名失败: {}", e);
+            } else {
+                println!("重命名成功: {} -> {}", path, newname);
+            }
+        }
+        "mv" => {
+            if parts.len() < 3 {
+                eprintln!("用法: mv <源文件> <目标路径>");
+                return;
+            }
+            let src = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            let dest_arg = parts[2];
+            // 解析目标路径：获取目标目录和新文件名
+            let (dest_dir, newname) = if dest_arg.ends_with('/') {
+                let dir = normalize_remote_path(client.get_current_remote_path(), dest_arg);
+                let name = Path::new(&src)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                (dir, name.to_string())
+            } else {
+                let full_dest = normalize_remote_path(client.get_current_remote_path(), dest_arg);
+                let parent = Path::new(&full_dest)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("/");
+                let name = Path::new(&full_dest)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                (parent.to_string(), name.to_string())
+            };
+            // 判断是否同目录：同目录直接用 rename，否则先 cp 再 rm
+            let src_dir = Path::new(&src)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("/");
+            if src_dir == dest_dir {
+                if let Err(e) = client.rename_file(&src, &newname).await {
+                    eprintln!("移动失败: {}", e);
+                } else {
+                    println!("移动成功: {} -> {}/{}", src, dest_dir, newname);
+                }
+            } else {
+                if let Err(e) = client.copy_file(&src, &dest_dir, &newname).await {
+                    eprintln!("移动失败(复制阶段): {}", e);
+                    return;
+                }
+                if let Err(e) = client.delete_file(&src).await {
+                    eprintln!("移动警告: 文件已复制到 {}/{}，但删除源文件失败: {}", dest_dir, newname, e);
+                } else {
+                    println!("移动成功: {} -> {}/{}", src, dest_dir, newname);
+                }
+            }
+        }
+        "cp" => {
+            if parts.len() < 3 {
+                eprintln!("用法: cp <源文件> <目标路径>");
+                return;
+            }
+            let src = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            let dest_arg = parts[2];
+            // 将 dest_arg 解析为目录 + 新文件名
+            let (dest_dir, newname) = if dest_arg.ends_with('/') {
+                let dir = normalize_remote_path(client.get_current_remote_path(), dest_arg);
+                let name = Path::new(&src)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                (dir, name.to_string())
+            } else {
+                let full_dest = normalize_remote_path(client.get_current_remote_path(), dest_arg);
+                let parent = Path::new(&full_dest)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("/");
+                let name = Path::new(&full_dest)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                (parent.to_string(), name.to_string())
+            };
+            if let Err(e) = client.copy_file(&src, &dest_dir, &newname).await {
+                eprintln!("复制失败: {}", e);
+            } else {
+                println!("复制成功: {} -> {}/{}", src, dest_dir, newname);
+            }
+        }
+        "rm" => {
+            if parts.len() < 2 {
+                eprintln!("用法: rm <远程文件>");
+                return;
+            }
+            let path = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            if let Err(e) = client.delete_file(&path).await {
+                eprintln!("删除失败: {}", e);
+            } else {
+                println!("删除成功: {}", path);
+            }
+        }
+        "lcp" => {
+            if parts.len() < 3 {
+                eprintln!("用法: lcp <源文件> <目标路径>");
+                return;
+            }
+            let src = resolve_local_path(client.get_current_local_path(), parts[1]);
+            let dest_arg = parts[2];
+            let dest = if dest_arg.ends_with('/') {
+                let dir = resolve_local_path(client.get_current_local_path(), dest_arg);
+                let name = Path::new(&src)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                format!("{}/{}", dir, name)
+            } else {
+                resolve_local_path(client.get_current_local_path(), dest_arg)
+            };
+            if let Err(e) = fs::copy(&src, &dest) {
+                eprintln!("本地复制失败: {}", e);
+            } else {
+                println!("复制成功: {} -> {}", src, dest);
+            }
+        }
+        "lmv" => {
+            if parts.len() < 3 {
+                eprintln!("用法: lmv <源文件> <目标路径>");
+                return;
+            }
+            let src = resolve_local_path(client.get_current_local_path(), parts[1]);
+            let dest_arg = parts[2];
+            let dest = if dest_arg.ends_with('/') {
+                let dir = resolve_local_path(client.get_current_local_path(), dest_arg);
+                let name = Path::new(&src)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled");
+                format!("{}/{}", dir, name)
+            } else {
+                resolve_local_path(client.get_current_local_path(), dest_arg)
+            };
+            match fs::rename(&src, &dest) {
+                Ok(()) => println!("移动成功: {} -> {}", src, dest),
+                Err(_) => {
+                    // 跨文件系统时 rename 可能失败，尝试 cp + rm
+                    if let Err(e2) = fs::copy(&src, &dest) {
+                        eprintln!("移动失败: {}", e2);
+                    } else if let Err(e3) = fs::remove_file(&src) {
+                        eprintln!("移动警告: 文件已复制到 {}，但删除源文件失败: {}", dest, e3);
+                    } else {
+                        println!("移动成功: {} -> {}", src, dest);
+                    }
+                }
+            }
+        }
+        "lrm" => {
+            if parts.len() < 2 {
+                eprintln!("用法: lrm <本地文件>");
+                return;
+            }
+            let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!("删除失败: {}", e);
+            } else {
+                println!("删除成功: {}", path);
+            }
+        }
         "exit" | "quit" | "bye" => {
             println!("bye");
             std::process::exit(0);
