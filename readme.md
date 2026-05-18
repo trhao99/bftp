@@ -1,40 +1,51 @@
 ## 连接与退出
 ```bash
-bftp user            # 连接到制定用户，若没有则新建用户
-bftp #连接到默认用户
-exit 或 quit                     # 退出SFTP
-bye                             # 退出SFTP
+bftp user                        # 连接到指定用户，若没有则新建用户
+bftp                             # 连接到默认用户
+exit / quit / bye                # 退出
 ```
 
 ## 导航命令
 ```bash
-pwd                             # 显示远程当前目录
-lpwd                            # 显示本地当前目录
-cd /path/to/dir                 # 切换远程目录
-lcd /path/to/dir                # 切换本地目录
-ls [-l]                        # 列出远程目录内容
-lls [-la]                       # 列出本地目录内容
+pwd                              # 显示远程当前目录
+lpwd                             # 显示本地当前目录
+cd /path/to/dir                  # 切换远程目录
+lcd /path/to/dir                 # 切换本地目录
+ls                               # 列出远程目录内容
+lls [-la]                        # 列出本地目录内容
 ```
 
 ## 文件传输
 ### 上传文件（本地→远程）
 ```bash
-put localfile                   # 上传单个文件
-put -r localdir                 # 递归上传整个目录
-put localfile remotefile        # 上传并重命名
+put localfile                    # 上传单个文件到远程当前目录
+put localfile remotefile         # 上传并重命名
 ```
 
 ### 下载文件（远程→本地）
 ```bash
-get remotefile                  # 下载单个文件
-get -r remotedir                # 递归下载整个目录
-get remotefile localfile        # 下载并重命名
+get remotefile                   # 下载单个文件到本地当前目录
+get remotefile localfile         # 下载并重命名/指定本地路径
+get -r remotedir                 # 递归下载整个目录到本地当前目录
+get -r remotedir localdir        # 递归下载到指定本地目录
 ```
 
-## 文件操作
+## 远程文件操作
 ```bash
-rm filename                     # 删除远程文件
-rmdir dirname                   # 删除远程空目录
-mkdir dirname                   # 创建远程目录
-mv oldname newname              # 重命名/移动远程文件
+rename file newname              # 重命名远程文件（同目录内）
+mv source dest                   # 移动远程文件（同目录→重命名，跨目录→复制后删除）
+cp source dest                   # 复制远程文件到目标路径
+rm filename                      # 删除远程文件
 ```
+
+## 本地文件操作
+```bash
+lmv source dest                  # 移动本地文件
+lcp source dest                  # 复制本地文件
+lrm filename                     # 删除本地文件
+```
+
+## 路径说明
+- 远程路径支持绝对路径（以 `/` 开头）和相对路径（基于远程当前目录）
+- 本地路径支持绝对路径和相对路径（基于本地当前目录）
+- `cp`、`mv`、`lcp`、`lmv` 的目标路径以 `/` 结尾时视为目录，保留源文件名
