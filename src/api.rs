@@ -10,7 +10,7 @@ use std::{
     path::Path,
     str, string,
 };
-use serde_json::Value;
+
 
 
 /// 百度网盘API响应通用结构
@@ -44,14 +44,16 @@ pub struct UserInfoResponse {
 /// 容量信息
 #[derive(Debug, Deserialize)]
 pub struct CapacityInfoResponse {
+    pub errno: i32,
     // 总空间大小 单位B
-    pub total: u32,
+    pub total: u64,
     // 7天内是否有容量到期
     pub expire: bool,
     // 已使用大小 单位B
-    pub used: u32,
+    pub used: u64,
     // 免费容量 单位B
-    pub free: u32,
+    pub free: u64,
+    pub request_id: Option<u64>,
 }
 
 /// 文件列表响应
@@ -135,6 +137,7 @@ pub struct CategoryFileListResponse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde_repr::Serialize_repr, serde_repr::Deserialize_repr)]
 #[repr(u32)]
 pub enum FileType {
+    Unknown = 0,  // 未知
     Video = 1,    // 视频
     Audio = 2,    // 音频
     Image = 3,    // 图片
@@ -233,12 +236,16 @@ pub struct SemanticFileInfo {
     pub isdir: i32,
     pub parent_path: String,
     pub path: String,
-    pub content: String,
-    pub pid: u64,
-    pub ocr: String,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u64>,
+    #[serde(default)]
+    pub ocr: Option<String>,
     pub server_ctime: u64,
     pub server_mtime: u64,
-    pub size: u64
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 /// 语义搜索data
 #[derive(Debug, Deserialize)]
@@ -248,13 +255,16 @@ pub struct SemanticData {
     pub list: Vec<SemanticFileInfo>,
     pub source: i32
 }
-/// 语义搜索
+/// 语义搜索响应
 #[derive(Debug, Deserialize)]
 pub struct SearchFileBySemanticResponse {
-    #[serde(flatten)]
-    pub base: BaiduApiErrNoResponse,
+    pub error_no: i32,
+    pub error_msg: Option<String>,
+    pub is_end: bool,
+    pub request_id: u64,
+    pub server_time: Option<u64>,
     // 文件信息列表
-    pub data: Vec<SemanticData>,
+    pub data: Option<Vec<SemanticData>>,
 }
 /// 管理文件响应
 #[derive(Debug, Deserialize)]
@@ -795,6 +805,97 @@ impl BaiduApiClient {
         println!("下载完成: {} 个文件", files.len());
         Ok(())
     }
+
+    /// 关键字搜索文件
+    pub async fn search_files_by_keyword(
+        &self,
+        key: &str,
+        dir: Option<&str>,
+        recursion: bool,
+    ) -> anyhow::Result<SearchFileByKeywordResponse> {
+        let encoded_key = urlencoding::encode(key);
+        let mut url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=search&access_token={}&key={}",
+            self.access_token, encoded_key
+        );
+        if let Some(d) = dir {
+            url.push_str(&format!("&dir={}", urlencoding::encode(d)));
+        } else {
+            url.push_str(&format!("&dir={}", urlencoding::encode(&self.current_remote_path)));
+        }
+        if recursion {
+            url.push_str("&recursion=1");
+        }
+        let response = self.client.get(&url)
+            .header("User-Agent", "pan.baidu.com")
+            .send().await?;
+        let result: SearchFileByKeywordResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("关键字搜索失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
+        }
+        Ok(result)
+    }
+
+    /// 语义搜索文件
+    pub async fn search_files_semantic(
+        &self,
+        query: &str,
+        search_type: i32,
+        dir: Option<&str>,
+    ) -> anyhow::Result<SearchFileBySemanticResponse> {
+        let dir_val = dir.unwrap_or(&self.current_remote_path);
+        let url = format!(
+            "https://pan.baidu.com/xpan/unisearch?access_token={}&scene=mcpserver&query={}&search_type={}&num=500&dir={}",
+            self.access_token,
+            urlencoding::encode(query),
+            search_type,
+            urlencoding::encode(dir_val),
+        );
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/json")
+            .body("{}")
+            .send().await?;
+        let result: SearchFileBySemanticResponse = response.json().await?;
+        if result.error_no != 0 {
+            return Err(anyhow!("语义搜索失败: error_no={}, error_msg={:?}", result.error_no, result.error_msg));
+        }
+        Ok(result)
+    }
+
+    /// 获取网盘容量信息
+    pub async fn get_capacity_info(&self) -> anyhow::Result<CapacityInfoResponse> {
+        let url = format!(
+            "https://pan.baidu.com/api/quota?access_token={}",
+            self.access_token
+        );
+        let response = self.client.get(&url).send().await?;
+        let result: CapacityInfoResponse = response.json().await?;
+        if result.errno != 0 {
+            return Err(anyhow!("获取容量信息失败: errno={}", result.errno));
+        }
+        Ok(result)
+    }
+
+    /// 创建远程目录
+    pub async fn create_remote_dir(&self, path: &str) -> anyhow::Result<CreateFileResponse> {
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/xpan/file?method=create&access_token={}",
+            self.access_token
+        );
+        let body = format!(
+            "path={}&isdir=1&rtype=0",
+            urlencoding::encode(path),
+        );
+        let response = self.client.post(&url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send().await?;
+        let result: CreateFileResponse = response.json().await?;
+        if result.base.errno != 0 {
+            return Err(anyhow!("创建远程目录失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
+        }
+        Ok(result)
+    }
 }
 
 /// 从回调URL片段中提取access_token
@@ -913,6 +1014,7 @@ pub fn print_file_list(filesinfo: &FileListResponse) {
                     FileType::App => "应用",
                     FileType::Other => "其他",
                     FileType::Torrent => "种子",
+                    FileType::Unknown => "未知",
                 })
             };
 
@@ -921,6 +1023,89 @@ pub fn print_file_list(filesinfo: &FileListResponse) {
 
             println!("{} {:>8} {} {} {}", file_type, size_str, time_str, type_name, name);
         }
+    }
+}
+
+/// 打印关键字搜索结果
+pub fn print_keyword_search_results(response: &SearchFileByKeywordResponse) {
+    if response.list.is_empty() {
+        println!("(无搜索结果)");
+        return;
+    }
+    for file in &response.list {
+        let file_type = if file.isdir == 1 { 'd' } else { '-' };
+        let size_str = format_size(file.size);
+        let time_str = format_timestamp(file.server_mtime.unwrap_or(0));
+        let type_name = if file.isdir == 1 {
+            String::from("dir     ")
+        } else {
+            format!("{:8}", match file.category {
+                FileType::Video => "视频",
+                FileType::Audio => "音乐",
+                FileType::Image => "图片",
+                FileType::Document => "文档",
+                FileType::App => "应用",
+                FileType::Other => "其他",
+                FileType::Torrent => "种子",
+                FileType::Unknown => "未知",
+            })
+        };
+        println!("{} {:>8} {} {} {}", file_type, size_str, time_str, type_name, file.path);
+    }
+    if response.has_more == 1 {
+        println!("... 更多结果未显示");
+    }
+}
+
+/// 打印语义搜索结果
+pub fn print_semantic_search_results(response: &SearchFileBySemanticResponse) {
+    if let Some(ref data_list) = response.data {
+        if data_list.is_empty() {
+            println!("(无搜索结果)");
+            return;
+        }
+        for data in data_list {
+            let source_name = match data.source {
+                4 => "文件名",
+                5 => "图片OCR",
+                7 => "文档向量",
+                8 => "视频向量",
+                9 => "音频向量",
+                11 => "文档内容",
+                13 => "证件卡片",
+                14 => "图片语义",
+                _ => "未知来源",
+            };
+            for file in &data.list {
+                let file_type = if file.isdir == 1 { 'd' } else { '-' };
+                let size_str = format_size(file.size.unwrap_or(0));
+                let time_str = format_timestamp(file.server_mtime);
+                let type_name = match file.category {
+                    FileType::Video => "视频    ",
+                    FileType::Audio => "音乐    ",
+                    FileType::Image => "图片    ",
+                    FileType::Document => "文档    ",
+                    FileType::App => "应用    ",
+                    FileType::Other => "其他    ",
+                    FileType::Torrent => "种子    ",
+                    FileType::Unknown => "未知    ",
+                };
+                println!("{} {:>8} {} {} [{}] {}",
+                    file_type, size_str, time_str, type_name, source_name, file.path);
+                if let Some(ref c) = file.content {
+                    if !c.is_empty() {
+                        println!("  -> {}", c);
+                    }
+                }
+                if let Some(ref o) = file.ocr {
+                    if !o.is_empty() {
+                        println!("  -> OCR: {}", o);
+                    }
+                }
+            }
+        }
+    } else {
+        println!("(无搜索结果)");
     }
 }
 

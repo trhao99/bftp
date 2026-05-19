@@ -13,6 +13,10 @@ cd /path/to/dir                  # 切换远程目录
 lcd /path/to/dir                 # 切换本地目录
 ls                               # 列出远程目录内容
 lls [-la]                        # 列出本地目录内容
+mkdir dirname                    # 创建远程目录
+lmkdir dirname                   # 创建本地目录
+quota                            # 显示网盘容量信息
+clear                            # 清空控制台
 ```
 
 ## 文件传输
@@ -36,6 +40,15 @@ rename file newname              # 重命名远程文件（同目录内）
 mv source dest                   # 移动远程文件（同目录→重命名，跨目录→复制后删除）
 cp source dest                   # 复制远程文件到目标路径
 rm filename                      # 删除远程文件
+```
+
+## 远程文件搜索
+```bash
+search keyword [-r] [dir]        # 关键字搜索远程文件，-r 递归搜索子目录
+semsearch query [-t 0|1|2] [dir] # 语义搜索远程文件
+                                 #   -t 0: 关键字搜索
+                                 #   -t 1: 语义搜索（默认）
+                                 #   -t 2: 自动（查询>5字符使用语义）
 ```
 
 ## 本地文件操作

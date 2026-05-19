@@ -1,15 +1,88 @@
 mod config;
 mod api;
 
-use rustyline::DefaultEditor;
+use rustyline::history::DefaultHistory;
+use rustyline::completion::{Completer, Pair};
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::{Validator, ValidationResult, ValidationContext};
+use rustyline::{Context, Helper, Result as RustyResult};
 use rustyline::error::ReadlineError;
+use std::borrow::Cow;
 use std::env;
 
-use crate::api::{BaiduApiClient, ensure_valid_token, print_file_list};
+use crate::api::{BaiduApiClient, ensure_valid_token, print_file_list, print_keyword_search_results, print_semantic_search_results};
 use crate::config::Config;
 use std::path::Path;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+
+const COMMANDS: &[&str] = &[
+    "pwd", "lpwd", "quota",
+    "ls", "lls",
+    "cd", "lcd",
+    "mkdir", "lmkdir",
+    "search", "semsearch",
+    "put", "get",
+    "rename", "mv", "cp", "rm",
+    "lmv", "lcp", "lrm",
+    "clear",
+    "exit", "quit", "bye",
+];
+
+#[derive(Debug)]
+struct BftpHelper;
+
+impl Completer for BftpHelper {
+    type Candidate = Pair;
+
+    fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> RustyResult<(usize, Vec<Pair>)> {
+        let line_prefix = &line[..pos];
+        let (start, word) = match line_prefix.rsplit_once(char::is_whitespace) {
+            Some((_, w)) => (line_prefix.len() - w.len(), w),
+            None => (0, line_prefix),
+        };
+        let matches: Vec<Pair> = COMMANDS
+            .iter()
+            .filter(|cmd| cmd.starts_with(word))
+            .map(|cmd| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        Ok((start, matches))
+    }
+}
+
+impl Hinter for BftpHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for BftpHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        Cow::Borrowed(line)
+    }
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(&'s self, prompt: &'p str, _default: bool) -> Cow<'b, str> {
+        Cow::Borrowed(prompt)
+    }
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Borrowed(hint)
+    }
+}
+
+impl Validator for BftpHelper {
+    fn validate(&self, _ctx: &mut ValidationContext) -> RustyResult<ValidationResult> {
+        Ok(ValidationResult::Valid(None))
+    }
+    fn validate_while_typing(&self) -> bool {
+        false
+    }
+}
+
+impl Helper for BftpHelper {}
 
 
 /// 处理命令行参数，返回用户名和 token
@@ -31,7 +104,7 @@ fn handle_command_line_args(mut config: Config, args: &[String]) -> (Config, Str
 }
 
 /// 解析并执行命令
-async fn execute_command(line: &str, client: &mut BaiduApiClient) {
+async fn execute_command(line: &str, client: &mut BaiduApiClient, rl: &mut rustyline::Editor<BftpHelper, DefaultHistory>) {
     let line = line.trim();
     if line.is_empty() {
         return;
@@ -44,6 +117,20 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
         "pwd" => {
             // 显示远程当前目录
             println!("{}", client.get_current_remote_path());
+        }
+        "quota" => {
+            // 显示网盘容量信息
+            match client.get_capacity_info().await {
+                Ok(info) => {
+                    println!("总空间: {}", format_local_size(info.total));
+                    println!("已使用: {}", format_local_size(info.used));
+                    println!("免费容量:   {}", format_local_size(info.free));
+                    if info.expire {
+                        println!("注意: 7天内有容量到期");
+                    }
+                }
+                Err(e) => eprintln!("获取容量信息失败: {:?}", e),
+            }
         }
         "lpwd" => {
             // 显示本地当前目录
@@ -58,6 +145,96 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
                 Err(e) => {
                     eprintln!("获取远程文件列表失败: {:?}", e);
                 }
+            }
+        }
+        "mkdir" => {
+            // 创建远程目录
+            if parts.len() < 2 {
+                eprintln!("用法: mkdir <目录名>");
+                return;
+            }
+            let path = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            match client.create_remote_dir(&path).await {
+                Ok(result) => println!("创建远程目录成功: {}", result.path.as_deref().unwrap_or(&path)),
+                Err(e) => eprintln!("创建远程目录失败: {:?}", e),
+            }
+        }
+        "lmkdir" => {
+            // 创建本地目录
+            if parts.len() < 2 {
+                eprintln!("用法: lmkdir <目录名>");
+                return;
+            }
+            let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+            match fs::create_dir_all(&path) {
+                Ok(()) => println!("创建本地目录成功: {}", path),
+                Err(e) => eprintln!("创建本地目录失败: {}", e),
+            }
+        }
+        "search" => {
+            // 关键字搜索远程文件
+            if parts.len() < 2 {
+                eprintln!("用法: search <关键字> [-r] [目录]");
+                return;
+            }
+            let mut recursion = false;
+            let mut dir: Option<&str> = None;
+            let mut key_parts: Vec<&str> = Vec::new();
+            let mut i = 1;
+            while i < parts.len() {
+                if parts[i] == "-r" {
+                    recursion = true;
+                } else if parts[i].starts_with('/') {
+                    dir = Some(parts[i]);
+                } else {
+                    key_parts.push(parts[i]);
+                }
+                i += 1;
+            }
+            let key = key_parts.join(" ");
+            if key.is_empty() {
+                eprintln!("用法: search <关键字> [-r] [目录]");
+                return;
+            }
+            match client.search_files_by_keyword(&key, dir, recursion).await {
+                Ok(results) => print_keyword_search_results(&results),
+                Err(e) => eprintln!("搜索失败: {:?}", e),
+            }
+        }
+        "semsearch" => {
+            // 语义搜索远程文件
+            if parts.len() < 2 {
+                eprintln!("用法: semsearch <查询内容> [-t 0|1|2] [目录]");
+                eprintln!("  -t 0: 关键字搜索 (默认)");
+                eprintln!("  -t 1: 语义搜索");
+                eprintln!("  -t 2: 自动 (查询>5字符使用语义)");
+                return;
+            }
+            let mut search_type = 1i32;
+            let mut dir: Option<&str> = None;
+            let mut query_parts: Vec<&str> = Vec::new();
+            let mut i = 1;
+            while i < parts.len() {
+                if parts[i] == "-t" {
+                    if i + 1 < parts.len() {
+                        search_type = parts[i + 1].parse().unwrap_or(1);
+                        i += 1;
+                    }
+                } else if parts[i].starts_with('/') {
+                    dir = Some(parts[i]);
+                } else {
+                    query_parts.push(parts[i]);
+                }
+                i += 1;
+            }
+            let query = query_parts.join(" ");
+            if query.is_empty() {
+                eprintln!("用法: semsearch <查询内容> [-t 0|1|2] [目录]");
+                return;
+            }
+            match client.search_files_semantic(&query, search_type, dir).await {
+                Ok(results) => print_semantic_search_results(&results),
+                Err(e) => eprintln!("语义搜索失败: {:?}", e),
             }
         }
         "lls" => {
@@ -357,6 +534,11 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient) {
                 println!("删除成功: {}", path);
             }
         }
+        "clear" => {
+            // 清空控制台
+            print!("\x1B[2J\x1B[1;1H");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
         "exit" | "quit" | "bye" => {
             println!("bye");
             std::process::exit(0);
@@ -565,14 +747,15 @@ async fn main() -> anyhow::Result<()> {
     let userinfo = client.get_user_info().await?;
     println!("baidu_name: {:?} ",userinfo.baidu_name.unwrap());
     // `()` can be used when no completer is required
-    let mut rl = DefaultEditor::new()?;
+    let mut rl = rustyline::Editor::<BftpHelper, DefaultHistory>::new()?;
+    rl.set_helper(Some(BftpHelper));
 
     loop {
         let readline = rl.readline(">> ");
         match readline {
             Ok(line) => {
                 rl.add_history_entry(line.as_str())?;
-                execute_command(&line, &mut client).await;
+                execute_command(&line, &mut client, &mut rl).await;
             }
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
