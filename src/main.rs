@@ -722,6 +722,89 @@ fn resolve_local_path(current_local_path: &str, target: &str) -> String {
     }
 }
 
+/// 打印当前配置信息
+fn print_config(config: &Config) {
+    println!("当前配置:");
+    println!("  client_id:    {}", config.client_id);
+    println!("  redirect_uri: {}", config.redirect_uri);
+    println!("  scope:        {}", config.scope);
+    println!("  默认用户:     {}", config.default);
+    println!("  用户列表:");
+    for user in config.get_users() {
+        let has_token = config.get_user_token(user).map_or(false, |t| !t.is_empty());
+        let status = if has_token { "已授权" } else { "未授权" };
+        if *user == config.default {
+            println!("    * {} ({})", user, status);
+        } else {
+            println!("    - {} ({})", user, status);
+        }
+    }
+}
+
+/// 处理 bftp config 子命令
+fn handle_config_command(mut config: Config, args: &[String]) -> anyhow::Result<()> {
+    if args.len() <= 2 {
+        print_config(&config);
+        return Ok(());
+    }
+
+    match args[2].as_str() {
+        "show" => print_config(&config),
+        "set-default" => {
+            if args.len() < 4 {
+                eprintln!("用法: bftp config set-default <用户名>");
+                return Ok(());
+            }
+            let username = &args[3];
+            if !config.has_user(username) {
+                eprintln!("用户 '{}' 不存在", username);
+                return Ok(());
+            }
+            config.set_default_user(username);
+            config.save_default()?;
+            println!("默认用户已切换为: {}", username);
+        }
+        "add-user" => {
+            if args.len() < 4 {
+                eprintln!("用法: bftp config add-user <用户名>");
+                return Ok(());
+            }
+            let username = &args[3];
+            config.add_user(username, None);
+            config.save_default()?;
+            println!("用户 '{}' 已添加", username);
+        }
+        "remove-user" => {
+            if args.len() < 4 {
+                eprintln!("用法: bftp config remove-user <用户名>");
+                return Ok(());
+            }
+            let username = &args[3];
+            if config.remove_user(username).is_none() {
+                eprintln!("用户 '{}' 不存在", username);
+                return Ok(());
+            }
+            config.save_default()?;
+            println!("用户 '{}' 已删除", username);
+        }
+        "list-users" => {
+            println!("用户列表:");
+            for user in config.get_users() {
+                if *user == config.default {
+                    println!("  * {} (默认)", user);
+                } else {
+                    println!("  - {}", user);
+                }
+            }
+        }
+        _ => {
+            eprintln!("未知子命令: {}", args[2]);
+            eprintln!("可用子命令: show, set-default, add-user, remove-user, list-users");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -734,6 +817,12 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
+
+    // 处理 config 子命令（不需要鉴权）
+    if args.len() > 1 && args[1] == "config" {
+        return handle_config_command(config, &args);
+    }
+
     // 验证配置
     if let Err(e) = config.validate() {
         eprintln!("配置验证失败: {}", e);

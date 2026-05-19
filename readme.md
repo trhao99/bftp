@@ -5,6 +5,16 @@ bftp                             # 连接到默认用户
 exit / quit / bye                # 退出
 ```
 
+## 配置管理
+```bash
+bftp config                      # 显示当前配置
+bftp config show                 # 同上
+bftp config list-users           # 列出所有用户
+bftp config add-user <用户名>     # 添加新用户
+bftp config remove-user <用户名>  # 删除用户
+bftp config set-default <用户名>  # 切换默认用户
+```
+
 ## 导航命令
 ```bash
 pwd                              # 显示远程当前目录
