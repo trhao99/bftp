@@ -141,15 +141,7 @@ impl Config {
     /// 验证配置是否完整
     pub fn validate(&self) -> Result<(), String> {
         if self.client_id.is_empty() {
-            return Err("client_id 不能为空".to_string());
-        }
-
-        if self.users.is_empty() {
-            return Err("至少需要配置一个用户".to_string());
-        }
-
-        if !self.users.contains_key(&self.default) {
-            return Err(format!("默认用户 '{}' 不存在于用户列表中", self.default));
+            return Err("client_id 不能为空, 请参照 https://pan.baidu.com/union/doc/Bl0eta7z8 文档进行应用接入".to_string());
         }
 
         Ok(())
