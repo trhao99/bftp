@@ -62,14 +62,20 @@ impl Config {
         self.get_or_create_user_token(&default_user)
     }
 
-    /// 从指定路径读取配置文件
+    /// 从指定路径读取配置文件，若文件不存在则创建默认配置
     pub fn load_from_path(path: &PathBuf) -> anyhow::Result<Self> {
-        let content = fs::read_to_string(path)?;
-        let config: Config = serde_json::from_str(&content)?;
-        Ok(config)
+        if path.exists() {
+            let content = fs::read_to_string(path)?;
+            let config: Config = serde_json::from_str(&content)?;
+            Ok(config)
+        } else {
+            let config = Config::default();
+            config.save_to_path(path)?;
+            Ok(config)
+        }
     }
 
-    /// 从默认路径读取配置文件 (~/.btfp/config.json)
+    /// 从默认路径读取配置文件 (~/.bftp/config.json)
     pub fn load_default() -> anyhow::Result<Self> {
         let config_path = Self::get_default_path()?;
         Self::load_from_path(&config_path)
