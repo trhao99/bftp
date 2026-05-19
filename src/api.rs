@@ -351,10 +351,13 @@ pub struct BaiduApiClient {
 impl BaiduApiClient {
     /// 创建新的API客户端
     pub fn new(access_token: String) -> Self {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| String::from("/"));
         Self {
             client: Client::new(),
             access_token,
-            current_local_path: String::from("/"),
+            current_local_path: home,
             current_remote_path: String::from("/")
         }
     }

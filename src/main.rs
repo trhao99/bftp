@@ -462,6 +462,10 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient, rl: &mut rusty
                 return;
             }
             let path = normalize_remote_path(client.get_current_remote_path(), parts[1]);
+            if !confirm_delete(&path) {
+                println!("已取消");
+                return;
+            }
             if let Err(e) = client.delete_file(&path).await {
                 eprintln!("删除失败: {}", e);
             } else {
@@ -528,6 +532,10 @@ async fn execute_command(line: &str, client: &mut BaiduApiClient, rl: &mut rusty
                 return;
             }
             let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+            if !confirm_delete(&path) {
+                println!("已取消");
+                return;
+            }
             if let Err(e) = fs::remove_file(&path) {
                 eprintln!("删除失败: {}", e);
             } else {
@@ -707,6 +715,16 @@ fn simplify_path(path: &str) -> String {
     } else {
         format!("/{}", stack.join("/"))
     }
+}
+
+/// 删除确认提示，返回 true 表示确认删除
+fn confirm_delete(path: &str) -> bool {
+    use std::io::{self, Write};
+    print!("确认删除 {}? (y/N): ", path);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// 解析本地文件路径（支持相对路径和绝对路径）
