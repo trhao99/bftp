@@ -6,7 +6,10 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     os::unix::fs::FileExt,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::display::format_size;
@@ -398,15 +401,18 @@ impl BaiduApiClient {
         Ok(all_files)
     }
 
-    /// 通过 dlink 下载文件到本地
-    pub async fn download_from_url(&self, dlink: &str, local_path: &str, file_size: u64) -> anyhow::Result<u64> {
+    /// 通过 dlink 下载文件到本地，resume 为已下载字节数（0 表示全新下载）
+    pub async fn download_from_url(&self, dlink: &str, local_path: &str, file_size: u64, resume: u64) -> anyhow::Result<u64> {
         let url = format!("{}&access_token={}", dlink, self.access_token);
-        let mut response = self.client.get(&url)
-            .header("User-Agent", "pan.baidu.com")
-            .send()
-            .await?;
+        let mut req = self.client.get(&url)
+            .header("User-Agent", "pan.baidu.com");
+        if resume > 0 {
+            req = req.header("Range", format!("bytes={}-", resume));
+        }
+
+        let mut response = req.send().await?;
         let status = response.status();
-        if !status.is_success() {
+        if !status.is_success() && status.as_u16() != 206 {
             let body = response.text().await?;
             return Err(anyhow!("下载HTTP错误: status={}, body={}", status, body));
         }
@@ -422,9 +428,16 @@ impl BaiduApiClient {
                 .unwrap()
         );
         pb.set_message(local_path.to_string());
+        if resume > 0 {
+            pb.set_position(resume);
+        }
 
-        let mut file = File::create(local_path)?;
-        let mut downloaded: u64 = 0;
+        let mut file = if resume > 0 {
+            OpenOptions::new().write(true).open(local_path)?
+        } else {
+            File::create(local_path)?
+        };
+        let mut downloaded: u64 = resume;
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
             downloaded += chunk.len() as u64;
@@ -432,19 +445,20 @@ impl BaiduApiClient {
         }
         pb.finish_and_clear();
 
-        Ok(downloaded)
+        Ok(downloaded - resume)
     }
 
-    /// 通过 dlink 多线程下载文件
+    /// 通过 dlink 多线程下载文件，resume 为已下载字节数
     pub async fn download_from_url_multithreaded(
         &self,
         dlink: &str,
         local_path: &str,
         file_size: u64,
         num_threads: usize,
+        resume: u64,
     ) -> anyhow::Result<u64> {
-        if num_threads <= 1 || file_size < 4 * 1024 * 1024 {
-            return self.download_from_url(dlink, local_path, file_size).await;
+        if num_threads <= 1 || file_size.saturating_sub(resume) < 4 * 1024 * 1024 {
+            return self.download_from_url(dlink, local_path, file_size, resume).await;
         }
 
         let url = format!("{}&access_token={}", dlink, self.access_token);
@@ -452,9 +466,17 @@ impl BaiduApiClient {
         if let Some(parent) = Path::new(local_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let file = File::create(local_path)?;
-        file.set_len(file_size)?;
-        drop(file);
+        if resume == 0 {
+            let file = File::create(local_path)?;
+            file.set_len(file_size)?;
+        } else {
+            let file = OpenOptions::new().write(true).open(local_path)?;
+            file.set_len(file_size)?;
+        };
+
+        let progress_path = format!("{}.bftp_part", local_path);
+        let total = Arc::new(AtomicU64::new(resume));
+        File::create(&progress_path)?.write_at(&resume.to_le_bytes(), 0)?;
 
         let pb = Arc::new(ProgressBar::new(file_size));
         pb.set_style(
@@ -463,12 +485,16 @@ impl BaiduApiClient {
                 .unwrap()
         );
         pb.set_message(local_path.to_string());
+        if resume > 0 {
+            pb.set_position(resume);
+        }
 
-        let chunk_size = file_size.div_ceil(num_threads as u64);
+        let remaining = file_size - resume;
+        let chunk_size = remaining.div_ceil(num_threads as u64);
         let mut handles = Vec::with_capacity(num_threads);
 
         for i in 0..num_threads {
-            let start = i as u64 * chunk_size;
+            let start = resume + i as u64 * chunk_size;
             if start >= file_size {
                 break;
             }
@@ -477,6 +503,8 @@ impl BaiduApiClient {
             let client = self.client.clone();
             let local_path = local_path.to_string();
             let pb = pb.clone();
+            let total = total.clone();
+            let progress_path = progress_path.clone();
 
             handles.push(tokio::spawn(async move {
                 let mut response = client
@@ -499,6 +527,9 @@ impl BaiduApiClient {
                     file.write_at(&chunk, offset)?;
                     offset += chunk.len() as u64;
                     pb.inc(chunk.len() as u64);
+                    let n = total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
+                    let pf = OpenOptions::new().write(true).open(&progress_path)?;
+                    pf.write_at(&n.to_le_bytes(), 0)?;
                 }
 
                 Ok::<_, anyhow::Error>(offset - start)
@@ -512,6 +543,7 @@ impl BaiduApiClient {
             }
         }
         pb.finish_and_clear();
+        std::fs::remove_file(&progress_path).ok();
 
         Ok(downloaded)
     }
@@ -538,8 +570,17 @@ impl BaiduApiClient {
             .ok_or_else(|| anyhow!("获取下载链接失败"))?;
         let dlink = &file_meta.dlink;
 
-        let size = self.download_from_url(dlink, local_path, file_info.size).await?;
-        println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(size));
+        let resume = check_resume(local_path, file_info.size);
+        if resume == file_info.size {
+            println!("文件已存在，跳过: {}", local_path);
+            return Ok(());
+        }
+        let new_bytes = self.download_from_url(dlink, local_path, file_info.size, resume).await?;
+        if resume > 0 {
+            println!("下载完成: {} (续传 {})", format_size(resume + new_bytes), format_size(resume));
+        } else {
+            println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(new_bytes));
+        }
         Ok(())
     }
 
@@ -571,7 +612,13 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            self.download_from_url(&file_meta.dlink, local_file_path.to_str().unwrap(), file_info.size).await?;
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                println!("[{}/{}] 文件已存在，跳过: {}", i + 1, files.len(), lp);
+                continue;
+            }
+            self.download_from_url(&file_meta.dlink, lp, file_info.size, resume).await?;
         }
 
         println!("下载完成: {} 个文件", files.len());
@@ -602,10 +649,20 @@ impl BaiduApiClient {
         let file_meta = metas.list.first()
             .ok_or_else(|| anyhow!("获取下载链接失败"))?;
 
-        let size = self.download_from_url_multithreaded(
-            &file_meta.dlink, local_path, file_info.size, num_threads,
+        let resume = check_resume(local_path, file_info.size);
+        if resume == file_info.size {
+            println!("文件已存在，跳过: {}", local_path);
+            return Ok(());
+        }
+        let new_bytes = self.download_from_url_multithreaded(
+            &file_meta.dlink, local_path, file_info.size, num_threads, resume,
         ).await?;
-        println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(size));
+        let total = resume + new_bytes;
+        if resume > 0 {
+            println!("下载完成: {} (续传 {})", format_size(total), format_size(resume));
+        } else {
+            println!("下载成功: {} ({} 已写入)", format_size(total), format_size(new_bytes));
+        }
         Ok(())
     }
 
@@ -641,11 +698,14 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                println!("[{}/{}] 文件已存在，跳过: {}", i + 1, files.len(), lp);
+                continue;
+            }
             self.download_from_url_multithreaded(
-                &file_meta.dlink,
-                local_file_path.to_str().unwrap(),
-                file_info.size,
-                num_threads,
+                &file_meta.dlink, lp, file_info.size, num_threads, resume,
             ).await?;
         }
 
@@ -788,4 +848,30 @@ fn read_chunk(file_path: &str, chunk_index: usize) -> anyhow::Result<Vec<u8>> {
     let bytes_read = file.read(&mut buffer)?;
     buffer.truncate(bytes_read);
     Ok(buffer)
+}
+
+/// 检查本地文件是否存在，返回已下载的字节数用于续传
+/// 优先检查 .bftp_part 进度文件（多线程下载），其次检查文件大小（单线程下载）
+fn check_resume(local_path: &str, remote_size: u64) -> u64 {
+    let progress_path = format!("{}.bftp_part", local_path);
+    if let Ok(mut f) = File::open(&progress_path) {
+        let mut buf = [0u8; 8];
+        if f.read_exact(&mut buf).is_ok() {
+            let n = u64::from_le_bytes(buf);
+            if n >= remote_size {
+                std::fs::remove_file(&progress_path).ok();
+                return remote_size;
+            }
+            return n;
+        }
+        std::fs::remove_file(&progress_path).ok();
+    }
+    // 无进度文件时，用文件大小判断（单线程下载未预分配）
+    match std::fs::metadata(local_path) {
+        Ok(meta) if meta.is_file() => {
+            let local_size = meta.len();
+            if local_size >= remote_size { remote_size } else { local_size }
+        }
+        _ => 0,
+    }
 }
