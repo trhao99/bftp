@@ -751,7 +751,9 @@ async fn main() -> anyhow::Result<()> {
     rl.set_helper(Some(BftpHelper));
 
     loop {
-        let readline = rl.readline(">> ");
+        let prompt = format!("\x1b[1;36m{}\x1b[0m:\x1b[1;32m{}\x1b[0m> ",
+            username, client.get_current_remote_path());
+        let readline = rl.readline(&prompt);
         match readline {
             Ok(line) => {
                 rl.add_history_entry(line.as_str())?;
