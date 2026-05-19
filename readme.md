@@ -42,6 +42,11 @@ get remotefile                   # 下载单个文件到本地当前目录
 get remotefile localfile         # 下载并重命名/指定本地路径
 get -r remotedir                 # 递归下载整个目录到本地当前目录
 get -r remotedir localdir        # 递归下载到指定本地目录
+
+### 多线程下载（mget）
+mget remotefile [localfile]      # 多线程下载（默认4线程）
+mget -t N remotefile [localfile] # 指定线程数下载
+mget -r remotedir [localdir]     # 多线程递归下载目录
 ```
 
 ## 远程文件操作
@@ -72,3 +77,7 @@ lrm filename                     # 删除本地文件
 - 远程路径支持绝对路径（以 `/` 开头）和相对路径（基于远程当前目录）
 - 本地路径支持绝对路径和相对路径（基于本地当前目录）
 - `cp`、`mv`、`lcp`、`lmv` 的目标路径以 `/` 结尾时视为目录，保留源文件名
+
+## TODO
+1. [x] 多线程下载
+2. 命令支持通配符

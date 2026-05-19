@@ -1,9 +1,12 @@
 use anyhow::{Context, anyhow};
+use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::Client;
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
+    os::unix::fs::FileExt,
     path::Path,
+    sync::Arc,
 };
 
 use crate::display::format_size;
@@ -25,7 +28,6 @@ impl BaiduApiClient {
             .unwrap_or_else(|_| String::from("/"));
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
@@ -397,9 +399,9 @@ impl BaiduApiClient {
     }
 
     /// 通过 dlink 下载文件到本地
-    pub async fn download_from_url(&self, dlink: &str, local_path: &str) -> anyhow::Result<u64> {
+    pub async fn download_from_url(&self, dlink: &str, local_path: &str, file_size: u64) -> anyhow::Result<u64> {
         let url = format!("{}&access_token={}", dlink, self.access_token);
-        let response = self.client.get(&url)
+        let mut response = self.client.get(&url)
             .header("User-Agent", "pan.baidu.com")
             .send()
             .await?;
@@ -408,14 +410,110 @@ impl BaiduApiClient {
             let body = response.text().await?;
             return Err(anyhow!("下载HTTP错误: status={}, body={}", status, body));
         }
-        let bytes = response.bytes().await?;
-        let size = bytes.len() as u64;
+
         if let Some(parent) = Path::new(local_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
+
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg}\n{wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .unwrap()
+        );
+        pb.set_message(local_path.to_string());
+
         let mut file = File::create(local_path)?;
-        file.write_all(&bytes)?;
-        Ok(size)
+        let mut downloaded: u64 = 0;
+        while let Some(chunk) = response.chunk().await? {
+            file.write_all(&chunk)?;
+            downloaded += chunk.len() as u64;
+            pb.set_position(downloaded);
+        }
+        pb.finish_and_clear();
+
+        Ok(downloaded)
+    }
+
+    /// 通过 dlink 多线程下载文件
+    pub async fn download_from_url_multithreaded(
+        &self,
+        dlink: &str,
+        local_path: &str,
+        file_size: u64,
+        num_threads: usize,
+    ) -> anyhow::Result<u64> {
+        if num_threads <= 1 || file_size < 4 * 1024 * 1024 {
+            return self.download_from_url(dlink, local_path, file_size).await;
+        }
+
+        let url = format!("{}&access_token={}", dlink, self.access_token);
+
+        if let Some(parent) = Path::new(local_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = File::create(local_path)?;
+        file.set_len(file_size)?;
+        drop(file);
+
+        let pb = Arc::new(ProgressBar::new(file_size));
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg}\n{wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+                .unwrap()
+        );
+        pb.set_message(local_path.to_string());
+
+        let chunk_size = file_size.div_ceil(num_threads as u64);
+        let mut handles = Vec::with_capacity(num_threads);
+
+        for i in 0..num_threads {
+            let start = i as u64 * chunk_size;
+            if start >= file_size {
+                break;
+            }
+            let end = std::cmp::min(start + chunk_size, file_size) - 1;
+            let url = url.clone();
+            let client = self.client.clone();
+            let local_path = local_path.to_string();
+            let pb = pb.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut response = client
+                    .get(&url)
+                    .header("User-Agent", "pan.baidu.com")
+                    .header("Range", format!("bytes={}-{}", start, end))
+                    .send()
+                    .await
+                    .context("分片请求发送失败")?;
+
+                let status = response.status();
+                if !status.is_success() && status.as_u16() != 206 {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(anyhow!("下载分片 HTTP 错误: status={}, body={}", status, body));
+                }
+
+                let file = OpenOptions::new().write(true).open(&local_path)?;
+                let mut offset = start;
+                while let Some(chunk) = response.chunk().await? {
+                    file.write_at(&chunk, offset)?;
+                    offset += chunk.len() as u64;
+                    pb.inc(chunk.len() as u64);
+                }
+
+                Ok::<_, anyhow::Error>(offset - start)
+            }));
+        }
+
+        let mut downloaded: u64 = 0;
+        for handle in handles {
+            match handle.await.context("分片任务失败")?? {
+                size => downloaded += size,
+            }
+        }
+        pb.finish_and_clear();
+
+        Ok(downloaded)
     }
 
     /// 下载单个远程文件（通过路径查找 fs_id → dlink → 下载）
@@ -440,7 +538,7 @@ impl BaiduApiClient {
             .ok_or_else(|| anyhow!("获取下载链接失败"))?;
         let dlink = &file_meta.dlink;
 
-        let size = self.download_from_url(dlink, local_path).await?;
+        let size = self.download_from_url(dlink, local_path, file_info.size).await?;
         println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(size));
         Ok(())
     }
@@ -473,7 +571,82 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            self.download_from_url(&file_meta.dlink, local_file_path.to_str().unwrap()).await?;
+            self.download_from_url(&file_meta.dlink, local_file_path.to_str().unwrap(), file_info.size).await?;
+        }
+
+        println!("下载完成: {} 个文件", files.len());
+        Ok(())
+    }
+
+    /// 多线程下载单个远程文件
+    pub async fn download_file_mt(
+        &self,
+        remote_path: &str,
+        local_path: &str,
+        num_threads: usize,
+    ) -> anyhow::Result<()> {
+        let p = Path::new(remote_path);
+        let parent_dir = p.parent().and_then(|x| x.to_str()).unwrap_or("/");
+        let filename = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+
+        let file_list = self.list_files_in_dir(parent_dir).await?;
+        let file_info = file_list.list.as_ref()
+            .and_then(|files| files.iter().find(|f| f.server_filename == filename))
+            .ok_or_else(|| anyhow!("未找到远程文件: {}", remote_path))?;
+
+        if file_info.isdir == 1 {
+            return Err(anyhow!("{} 是目录，请使用 mget -r <目录> 下载", remote_path));
+        }
+
+        let metas = self.get_file_metas(&[file_info.fs_id]).await?;
+        let file_meta = metas.list.first()
+            .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+
+        let size = self.download_from_url_multithreaded(
+            &file_meta.dlink, local_path, file_info.size, num_threads,
+        ).await?;
+        println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(size));
+        Ok(())
+    }
+
+    /// 多线程递归下载远程目录
+    pub async fn download_dir_mt(
+        &self,
+        remote_dir: &str,
+        local_dir: &str,
+        num_threads: usize,
+    ) -> anyhow::Result<()> {
+        let all_entries = self.recursive_list(remote_dir).await?;
+        let files: Vec<_> = all_entries.iter().filter(|f| f.isdir == 0).collect();
+
+        if files.is_empty() {
+            println!("目录为空，没有文件可下载");
+            return Ok(());
+        }
+
+        println!("共 {} 个文件待下载", files.len());
+
+        for (i, file_info) in files.iter().enumerate() {
+            let rel_path = file_info.path.strip_prefix(remote_dir)
+                .unwrap_or(&file_info.path);
+            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+            let local_file_path = Path::new(local_dir).join(rel_path);
+
+            println!("[{}/{}] 下载: {} -> {}",
+                i + 1, files.len(),
+                file_info.path,
+                local_file_path.display()
+            );
+
+            let metas = self.get_file_metas(&[file_info.fs_id]).await?;
+            let file_meta = metas.list.first()
+                .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+            self.download_from_url_multithreaded(
+                &file_meta.dlink,
+                local_file_path.to_str().unwrap(),
+                file_info.size,
+                num_threads,
+            ).await?;
         }
 
         println!("下载完成: {} 个文件", files.len());

@@ -23,7 +23,7 @@ const COMMANDS: &[&str] = &[
     "cd", "lcd",
     "mkdir", "lmkdir",
     "search", "semsearch",
-    "put", "get",
+    "put", "get", "mget",
     "rename", "mv", "cp", "rm",
     "lmv", "lcp", "lrm",
     "clear",
@@ -58,6 +58,9 @@ const HELP_TEXT: &str = "\
   put <本地文件> [远程名]    上传文件
   get <远程文件> [本地路径]  下载文件
   get -r <远程目录> [本地]   递归下载目录
+  mget <远程文件> [本地路径] 多线程下载文件（默认4线程）
+  mget -t N <远程文件> [本地] 多线程下载（N线程）
+  mget -r <远程目录> [本地]  多线程递归下载目录
 
 \x1b[1m文件搜索:\x1b[0m
   search <关键字> [-r] [目录]     关键字搜索
@@ -372,7 +375,6 @@ pub async fn execute_command(
                 eprintln!("用法: get [-r] <远程文件> [本地路径]");
                 return;
             }
-            // get -r remotedir [localdir]
             if parts[1] == "-r" {
                 if parts.len() < 3 {
                     eprintln!("用法: get -r <远程目录> [本地目录]");
@@ -403,6 +405,69 @@ pub async fn execute_command(
                     resolve_local_path(client.get_current_local_path(), filename)
                 };
                 if let Err(e) = client.download_file(&remote_path, &local_path).await {
+                    eprintln!("下载失败: {}", e);
+                }
+            }
+        }
+        "mget" => {
+            if parts.len() < 2 {
+                eprintln!("用法: mget [-r] [-t 线程数] <远程文件> [本地路径]");
+                return;
+            }
+            let mut recursive = false;
+            let mut num_threads = 4usize;
+            let mut args_start = 1;
+
+            while args_start < parts.len() {
+                match parts[args_start] {
+                    "-r" => {
+                        recursive = true;
+                        args_start += 1;
+                    }
+                    "-t" => {
+                        if args_start + 1 < parts.len() {
+                            num_threads = parts[args_start + 1].parse().unwrap_or(4);
+                            args_start += 2;
+                        } else {
+                            eprintln!("用法: mget -t <线程数>");
+                            return;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+
+            if args_start >= parts.len() {
+                eprintln!("用法: mget [-r] [-t 线程数] <远程文件> [本地路径]");
+                return;
+            }
+
+            if recursive {
+                let remote_dir = normalize_path(client.get_current_remote_path(), parts[args_start]);
+                let local_dir = if args_start + 1 < parts.len() {
+                    resolve_local_path(client.get_current_local_path(), parts[args_start + 1])
+                } else {
+                    let dirname = Path::new(&remote_dir)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("download");
+                    resolve_local_path(client.get_current_local_path(), dirname)
+                };
+                if let Err(e) = client.download_dir_mt(&remote_dir, &local_dir, num_threads).await {
+                    eprintln!("下载失败: {}", e);
+                }
+            } else {
+                let remote_path = normalize_path(client.get_current_remote_path(), parts[args_start]);
+                let local_path = if args_start + 1 < parts.len() {
+                    resolve_local_path(client.get_current_local_path(), parts[args_start + 1])
+                } else {
+                    let filename = Path::new(&remote_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("download");
+                    resolve_local_path(client.get_current_local_path(), filename)
+                };
+                if let Err(e) = client.download_file_mt(&remote_path, &local_path, num_threads).await {
                     eprintln!("下载失败: {}", e);
                 }
             }
