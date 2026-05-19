@@ -82,6 +82,12 @@ impl Config {
         }
         let content = serde_json::to_string_pretty(self)?;
         fs::write(path, content)?;
+        // 设置文件权限为 600（仅所有者可读写）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -92,6 +98,7 @@ impl Config {
     }
 
     /// 获取当前默认用户的 access_token
+    #[allow(dead_code)]
     pub fn get_default_token(&self) -> Option<&String> {
         self.users.get(&self.default).map(|user| &user.access_token)
     }
