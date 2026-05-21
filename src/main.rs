@@ -1,18 +1,11 @@
-mod config;
-mod models;
-mod client;
-mod auth;
-mod display;
-mod cli;
-
 use rustyline::history::DefaultHistory;
 use rustyline::error::ReadlineError;
 use std::env;
 
-use crate::auth::ensure_valid_token;
-use crate::cli::{execute_command, handle_command_line_args, handle_config_command, BftpHelper};
-use crate::client::BaiduApiClient;
-use crate::config::Config;
+use bftp::auth::ensure_valid_token;
+use bftp::cli::{execute_command, handle_command_line_args, handle_config_command, BftpHelper};
+use bftp::client::BaiduApiClient;
+use bftp::config::Config;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

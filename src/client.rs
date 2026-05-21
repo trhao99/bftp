@@ -12,58 +12,113 @@ use std::{
     },
 };
 
+use crate::constants::*;
 use crate::display::format_size;
 use crate::models::*;
+use crate::session::Session;
+
+/// 下载策略
+#[derive(Debug, Clone, Copy)]
+pub struct DownloadOptions {
+    pub num_threads: usize,
+    pub resume: u64,
+}
+
+impl DownloadOptions {
+    pub fn single(resume: u64) -> Self {
+        Self { num_threads: 1, resume }
+    }
+    pub fn multi(resume: u64, num_threads: usize) -> Self {
+        Self { num_threads, resume }
+    }
+}
 
 /// 百度网盘API客户端
 pub struct BaiduApiClient {
     client: Client,
-    access_token: String,
-    current_remote_path: String,
-    current_local_path: String,
+    session: Session,
 }
 
 impl BaiduApiClient {
-    /// 创建新的API客户端
     pub fn new(access_token: String) -> Self {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| String::from("/"));
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
         Self {
             client,
-            access_token,
-            current_local_path: home,
-            current_remote_path: String::from("/")
+            session: Session::new(access_token),
         }
     }
-    /// 获取用户信息（验证token）
+
+    // ---- Session 访问 ----
+
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+
+    pub fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
+    pub fn get_current_remote_path(&self) -> &str {
+        &self.session.current_remote_path
+    }
+
+    pub fn get_current_local_path(&self) -> &str {
+        &self.session.current_local_path
+    }
+
+    pub fn set_current_remote_path(&mut self, path: String) {
+        self.session.current_remote_path = path;
+    }
+
+    pub fn set_current_local_path(&mut self, path: String) {
+        self.session.current_local_path = path;
+    }
+
+    // ---- API 方法 ----
+
+    fn api_url(&self, path: &str) -> String {
+        format!("{}{}&access_token={}", PAN_BAIDU_API_BASE, path, self.session.access_token)
+    }
+
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> anyhow::Result<T> {
+        let response = self.client.get(url).send().await?;
+        Ok(response.json().await?)
+    }
+
+    async fn post_form<T: serde::de::DeserializeOwned>(&self, url: &str, body: String) -> anyhow::Result<T> {
+        let response = self.client.post(url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?;
+        Ok(response.json().await?)
+    }
+
+    fn check<T: ApiResponse>(result: T, context: &str) -> anyhow::Result<T> {
+        if !result.is_success() {
+            return Err(anyhow!("{}: {}", context, result.error_desc()));
+        }
+        Ok(result)
+    }
+
     pub async fn get_user_info(&self) -> anyhow::Result<UserInfoResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/nas?method=uinfo&access_token={}&vip_version=v2",
-            self.access_token
-        );
-
-        let response = self.client.get(&url).send().await?;
-        let user_info: UserInfoResponse = response.json().await?;
-
-        Ok(user_info)
+        let url = self.api_url("/xpan/nas?method=uinfo&vip_version=v2");
+        self.get_json(&url).await
     }
+
     pub async fn get_remote_current_path_files_info(&self) -> anyhow::Result<FileListResponse> {
-        let url: String = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=list&access_token={}&dir={}",
-            self.access_token,
-            self.current_remote_path
+        let url = format!(
+            "{}&dir={}",
+            self.api_url("/xpan/file?method=list"),
+            self.session.current_remote_path
         );
-        let response = self.client.get(&url).send().await?;
-        let files_info: FileListResponse = response.json().await?;
-        Ok(files_info)
+        let result: FileListResponse = self.get_json(&url).await?;
+        Self::check(result, "列出文件失败")
     }
 
-    /// 验证token是否有效
     pub async fn verify_token(&self) -> bool {
         if let Ok(info) = self.get_user_info().await {
             info.base.errno == 0
@@ -72,308 +127,26 @@ impl BaiduApiClient {
         }
     }
 
-    /// 获取当前远程路径
-    pub fn get_current_remote_path(&self) -> &str {
-        &self.current_remote_path
-    }
-
-    /// 获取当前本地路径
-    pub fn get_current_local_path(&self) -> &str {
-        &self.current_local_path
-    }
-
-    /// 设置当前远程路径
-    pub fn set_current_remote_path(&mut self, path: String) {
-        self.current_remote_path = path;
-    }
-
-    /// 设置当前本地路径
-    pub fn set_current_local_path(&mut self, path: String) {
-        self.current_local_path = path;
-    }
-
-    /// 预上传 - 通知网盘新建上传任务
-    pub async fn precreate(&self, path: &str, size: u64, block_list: &str) -> anyhow::Result<PrecreateResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=precreate&access_token={}",
-            self.access_token
-        );
-        let body = format!(
-            "path={}&size={}&isdir=0&block_list={}&autoinit=1&rtype=1",
-            urlencoding::encode(path),
-            size,
-            urlencoding::encode(block_list),
-        );
-        let response = self.client.post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send().await?;
-        let result: PrecreateResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("预上传失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
-        }
-        Ok(result)
-    }
-
-    /// 获取上传域名
-    pub async fn locate_upload(&self, path: &str, uploadid: &str) -> anyhow::Result<String> {
-        let encoded_path = urlencoding::encode(path);
-        let url = format!(
-            "https://d.pcs.baidu.com/rest/2.0/pcs/file?method=locateupload&appid=250528&access_token={}&path={}&uploadid={}&upload_version=2.0",
-            self.access_token, encoded_path, uploadid
-        );
-        let response = self.client.get(&url).send().await?;
-        let result: LocateUploadResponse = response.json().await?;
-        if result.error_code != 0 {
-            return Err(anyhow!("获取上传域名失败: error_code={}, error_msg={:?}", result.error_code, result.error_msg));
-        }
-        if let Some(servers) = &result.servers {
-            for s in servers {
-                if s.server.starts_with("https://") {
-                    return Ok(s.server.clone());
-                }
-            }
-            if let Some(first) = servers.first() {
-                return Ok(first.server.clone());
-            }
-        }
-        Err(anyhow!("未获取到可用的上传域名"))
-    }
-
-    /// 分片上传
-    pub async fn upload_chunk(
-        &self,
-        domain: &str,
-        path: &str,
-        uploadid: &str,
-        partseq: i32,
-        data: Vec<u8>,
-    ) -> anyhow::Result<String> {
-        let encoded_path = urlencoding::encode(path);
-        let url = format!(
-            "{}/rest/2.0/pcs/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
-            domain, self.access_token, encoded_path, uploadid, partseq
-        );
-
-        // 手动构造 multipart/form-data body
-        let boundary = "bftp_upload_boundary";
-        let mut body: Vec<u8> = Vec::new();
-        write!(body, "--{}\r\n", boundary)?;
-        write!(body, "Content-Disposition: form-data; name=\"file\"; filename=\"blob\"\r\n")?;
-        write!(body, "Content-Type: application/octet-stream\r\n\r\n")?;
-        body.extend_from_slice(&data);
-        write!(body, "\r\n--{}--\r\n", boundary)?;
-
-        let content_type = format!("multipart/form-data; boundary={}", boundary);
-        let response = self.client.post(&url)
-            .header("Content-Type", &content_type)
-            .body(body)
-            .send()
-            .await?;
-        let status = response.status();
-        let body_text = response.text().await?;
-        if !status.is_success() {
-            return Err(anyhow!(
-                "分片上传HTTP错误: status={}, body={}",
-                status,
-                body_text
-            ));
-        }
-        let result: UploadChunkResponse = serde_json::from_str(&body_text)
-            .map_err(|e| anyhow!("解析分片上传响应失败: {}, body={}", e, body_text))?;
-        if let Some(errno) = result.errno {
-            if errno != 0 {
-                return Err(anyhow!("分片上传失败: errno={}, body={}", errno, body_text));
-            }
-        }
-        Ok(result.md5.unwrap_or_default())
-    }
-
-    /// 创建文件 - 合并分片完成上传
-    pub async fn create_file(
-        &self,
-        path: &str,
-        size: u64,
-        block_list: &str,
-        uploadid: &str,
-    ) -> anyhow::Result<CreateFileResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=create&access_token={}",
-            self.access_token
-        );
-        let body = format!(
-            "path={}&size={}&isdir=0&block_list={}&uploadid={}&rtype=1",
-            urlencoding::encode(path),
-            size,
-            urlencoding::encode(block_list),
-            urlencoding::encode(uploadid),
-        );
-        let response = self.client.post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send().await?;
-        let result: CreateFileResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("创建文件失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
-        }
-        Ok(result)
-    }
-
-    /// 上传单个文件到远程当前目录
-    pub async fn upload_file(&self, local_path: &str, remote_filename: Option<&str>) -> anyhow::Result<()> {
-        let local_file_path = Path::new(local_path);
-        if !local_file_path.exists() {
-            return Err(anyhow!("本地文件不存在: {}", local_path));
-        }
-        if !local_file_path.is_file() {
-            return Err(anyhow!("不是一个文件: {}", local_path));
-        }
-
-        let filename = remote_filename.unwrap_or_else(|| {
-            local_file_path.file_name().unwrap().to_str().unwrap()
-        });
-
-        let remote_path = if self.current_remote_path.ends_with('/') {
-            format!("{}{}", self.current_remote_path, filename)
-        } else {
-            format!("{}/{}", self.current_remote_path, filename)
-        };
-
-        println!("上传文件: {} -> {}", local_path, remote_path);
-
-        // 1. 计算 block_list
-        let (file_size, block_list, chunk_count) = compute_block_list(local_path)?;
-        println!("文件大小: {}, 分片数: {}", format_size(file_size), chunk_count);
-
-        // 2. 预上传
-        println!("[1/3] 预上传...");
-        let precreate_result = self.precreate(&remote_path, file_size, &block_list).await?;
-        let uploadid = precreate_result.uploadid.context("预上传未返回uploadid")?;
-        let chunks_to_upload = precreate_result.block_list.unwrap_or_else(|| vec![0]);
-        println!("uploadid: {}", uploadid);
-
-        // 3. 获取上传域名
-        println!("[2/3] 获取上传域名...");
-        let domain = self.locate_upload(&remote_path, &uploadid).await?;
-        println!("上传域名: {}", domain);
-
-        // 4. 分片上传
-        let total_chunks = chunks_to_upload.len();
-        for (i, &chunk_idx) in chunks_to_upload.iter().enumerate() {
-            let progress = format!("{}/{}", i + 1, total_chunks);
-            println!("[2/3] 上传分片 {} (index={})...", progress, chunk_idx);
-            let chunk_data = read_chunk(local_path, chunk_idx as usize)?;
-            let chunk_md5 = self.upload_chunk(&domain, &remote_path, &uploadid, chunk_idx, chunk_data).await?;
-            println!("  分片 {} md5: {}", chunk_idx, chunk_md5);
-        }
-
-        // 5. 创建文件
-        println!("[3/3] 创建文件...");
-        let result = self.create_file(&remote_path, file_size, &block_list, &uploadid).await?;
-        println!("上传成功!");
-        println!("  文件名: {}", result.server_filename.as_deref().unwrap_or(filename));
-        println!("  路径: {}", result.path.as_deref().unwrap_or(&remote_path));
-        println!("  大小: {}", format_size(result.size.unwrap_or(file_size)));
-        println!("  fs_id: {}", result.fs_id.unwrap_or(0));
-
-        Ok(())
-    }
-
-    /// 文件管理通用接口
-    pub async fn filemanager(&self, opera: &str, filelist: &str) -> anyhow::Result<FileManagerResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=filemanager&access_token={}&opera={}&async=0",
-            self.access_token, opera
-        );
-        let body = format!("filelist={}", urlencoding::encode(filelist));
-        let response = self.client.post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send()
-            .await?;
-        let result: FileManagerResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!(
-                "文件操作失败: errno={}, errmsg={:?}",
-                result.base.errno,
-                result.base.errmsg
-            ));
-        }
-        if let Some(ref info) = result.info {
-            for item in info {
-                if item.errno != 0 {
-                    return Err(anyhow!(
-                        "文件 {} 操作失败: errno={}",
-                        item.path.as_deref().unwrap_or("?"),
-                        item.errno
-                    ));
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    /// 重命名远程文件
-    pub async fn rename_file(&self, path: &str, newname: &str) -> anyhow::Result<()> {
-        let filelist = serde_json::to_string(&[serde_json::json!({
-            "path": path,
-            "newname": newname
-        })])?;
-        self.filemanager("rename", &filelist).await?;
-        Ok(())
-    }
-
-    /// 复制远程文件
-    pub async fn copy_file(&self, path: &str, dest: &str, newname: &str) -> anyhow::Result<()> {
-        let filelist = serde_json::to_string(&[serde_json::json!({
-            "path": path,
-            "dest": dest,
-            "newname": newname
-        })])?;
-        self.filemanager("copy", &filelist).await?;
-        Ok(())
-    }
-
-    /// 删除远程文件
-    pub async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
-        let filelist = serde_json::to_string(&[path])?;
-        self.filemanager("delete", &filelist).await?;
-        Ok(())
-    }
-
-    /// 列出指定目录的文件
     pub async fn list_files_in_dir(&self, dir: &str) -> anyhow::Result<FileListResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=list&access_token={}&dir={}",
-            self.access_token, dir
-        );
-        let response = self.client.get(&url).send().await?;
-        let result: FileListResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("列出文件失败: errno={}", result.base.errno));
-        }
-        Ok(result)
+        let url = format!("{}&dir={}", self.api_url("/xpan/file?method=list"), dir);
+        let result: FileListResponse = self.get_json(&url).await?;
+        Self::check(result, "列出文件失败")
     }
 
-    /// 获取文件元信息（含下载链接 dlink）
     pub async fn get_file_metas(&self, fsids: &[u64]) -> anyhow::Result<QueryFileInfoResponse> {
         let fsids_json = serde_json::to_string(fsids)?;
         let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=filemetas&access_token={}&fsids={}&dlink=1",
-            self.access_token, fsids_json
+            "{}/xpan/multimedia?method=filemetas&access_token={}&fsids={}&dlink=1",
+            PAN_BAIDU_API_BASE, self.session.access_token, fsids_json
         );
-        let response = self.client.get(&url).send().await?;
-        let result: QueryFileInfoResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("获取文件元信息失败: errno={}", result.base.errno));
-        }
+        let result: QueryFileInfoResponse = self.get_json(&url).await?;
+        let result = Self::check(result, "获取文件元信息失败")?;
         if result.list.is_empty() {
             return Err(anyhow!("未获取到文件元信息"));
         }
         Ok(result)
     }
 
-    /// 递归获取目录下所有文件（支持分页）
     pub async fn recursive_list(&self, path: &str) -> anyhow::Result<Vec<FileInfo>> {
         let encoded_path = urlencoding::encode(path);
         let mut all_files: Vec<FileInfo> = Vec::new();
@@ -381,14 +154,11 @@ impl BaiduApiClient {
 
         loop {
             let url = format!(
-                "https://pan.baidu.com/rest/2.0/xpan/multimedia?method=listall&access_token={}&path={}&recursion=1&start={}&limit=1000",
-                self.access_token, encoded_path, cursor
+                "{}/xpan/multimedia?method=listall&access_token={}&path={}&recursion=1&start={}&limit=1000",
+                PAN_BAIDU_API_BASE, self.session.access_token, encoded_path, cursor
             );
-            let response = self.client.get(&url).send().await?;
-            let result: CategoryFileListResponse = response.json().await?;
-            if result.base.errno != 0 {
-                return Err(anyhow!("递归列出文件失败: errno={}", result.base.errno));
-            }
+            let result: CategoryFileListResponse = self.get_json(&url).await?;
+            let result = Self::check(result, "递归列出文件失败")?;
             if let Some(list) = result.list {
                 all_files.extend(list);
             }
@@ -397,15 +167,37 @@ impl BaiduApiClient {
             }
             cursor = result.cursor;
         }
-
         Ok(all_files)
     }
 
-    /// 通过 dlink 下载文件到本地，resume 为已下载字节数（0 表示全新下载）
+    // ---- 下载 ----
+
+    /// 解析远程文件的 dlink（通过路径查找 fs_id → dlink）
+    async fn resolve_download_link(&self, remote_path: &str) -> anyhow::Result<(FileMeta, u64)> {
+        let p = Path::new(remote_path);
+        let parent_dir = p.parent().and_then(|x| x.to_str()).unwrap_or("/");
+        let filename = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
+
+        let file_list = self.list_files_in_dir(parent_dir).await?;
+        let file_info = file_list.list.as_ref()
+            .and_then(|files| files.iter().find(|f| f.server_filename == filename))
+            .ok_or_else(|| anyhow!("未找到远程文件: {}", remote_path))?;
+
+        if file_info.isdir == 1 {
+            return Err(anyhow!("{} 是目录，请使用 -r 下载", remote_path));
+        }
+
+        let metas = self.get_file_metas(&[file_info.fs_id]).await?;
+        let file_meta = metas.list.into_iter().next()
+            .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+        Ok((file_meta, file_info.size))
+    }
+
+    /// 通过 dlink 下载文件（单线程），返回新下载的字节数
     pub async fn download_from_url(&self, dlink: &str, local_path: &str, file_size: u64, resume: u64) -> anyhow::Result<u64> {
-        let url = format!("{}&access_token={}", dlink, self.access_token);
+        let url = format!("{}&access_token={}", dlink, self.session.access_token);
         let mut req = self.client.get(&url)
-            .header("User-Agent", "pan.baidu.com");
+            .header("User-Agent", USER_AGENT);
         if resume > 0 {
             req = req.header("Range", format!("bytes={}-", resume));
         }
@@ -448,7 +240,7 @@ impl BaiduApiClient {
         Ok(downloaded - resume)
     }
 
-    /// 通过 dlink 多线程下载文件，resume 为已下载字节数
+    /// 多线程下载，返回新下载的字节数
     pub async fn download_from_url_multithreaded(
         &self,
         dlink: &str,
@@ -457,22 +249,21 @@ impl BaiduApiClient {
         num_threads: usize,
         resume: u64,
     ) -> anyhow::Result<u64> {
-        if num_threads <= 1 || file_size.saturating_sub(resume) < 4 * 1024 * 1024 {
+        if num_threads <= 1 || file_size.saturating_sub(resume) < MULTITHREAD_MIN_SIZE {
             return self.download_from_url(dlink, local_path, file_size, resume).await;
         }
 
-        let url = format!("{}&access_token={}", dlink, self.access_token);
+        let url = format!("{}&access_token={}", dlink, self.session.access_token);
 
         if let Some(parent) = Path::new(local_path).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if resume == 0 {
-            let file = File::create(local_path)?;
-            file.set_len(file_size)?;
+        let file = if resume == 0 {
+            File::create(local_path)?
         } else {
-            let file = OpenOptions::new().write(true).open(local_path)?;
-            file.set_len(file_size)?;
+            OpenOptions::new().write(true).open(local_path)?
         };
+        file.set_len(file_size)?;
 
         let progress_path = format!("{}.bftp_part", local_path);
         let total = Arc::new(AtomicU64::new(resume));
@@ -509,7 +300,7 @@ impl BaiduApiClient {
             handles.push(tokio::spawn(async move {
                 let mut response = client
                     .get(&url)
-                    .header("User-Agent", "pan.baidu.com")
+                    .header("User-Agent", USER_AGENT)
                     .header("Range", format!("bytes={}-{}", start, end))
                     .send()
                     .await
@@ -528,19 +319,18 @@ impl BaiduApiClient {
                     offset += chunk.len() as u64;
                     pb.inc(chunk.len() as u64);
                     let n = total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
-                    let pf = OpenOptions::new().write(true).open(&progress_path)?;
-                    pf.write_at(&n.to_le_bytes(), 0)?;
+                    if let Ok(pf) = OpenOptions::new().write(true).open(&progress_path) {
+                        pf.write_at(&n.to_le_bytes(), 0)?;
+                    }
                 }
-
                 Ok::<_, anyhow::Error>(offset - start)
             }));
         }
 
         let mut downloaded: u64 = 0;
         for handle in handles {
-            match handle.await.context("分片任务失败")?? {
-                size => downloaded += size,
-            }
+            let size = handle.await.context("分片任务失败")??;
+            downloaded += size;
         }
         pb.finish_and_clear();
         std::fs::remove_file(&progress_path).ok();
@@ -548,164 +338,72 @@ impl BaiduApiClient {
         Ok(downloaded)
     }
 
-    /// 下载单个远程文件（通过路径查找 fs_id → dlink → 下载）
-    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> anyhow::Result<()> {
-        let p = Path::new(remote_path);
-        let parent_dir = p.parent().and_then(|x| x.to_str()).unwrap_or("/");
-        let filename = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
-
-        // 列出父目录，查找文件 fs_id
-        let file_list = self.list_files_in_dir(parent_dir).await?;
-        let file_info = file_list.list.as_ref()
-            .and_then(|files| files.iter().find(|f| f.server_filename == filename))
-            .ok_or_else(|| anyhow!("未找到远程文件: {}", remote_path))?;
-
-        if file_info.isdir == 1 {
-            return Err(anyhow!("{} 是目录，请使用 get -r <目录> 下载", remote_path));
-        }
-
-        // 获取 dlink 并下载
-        let metas = self.get_file_metas(&[file_info.fs_id]).await?;
-        let file_meta = metas.list.first()
-            .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-        let dlink = &file_meta.dlink;
-
-        let resume = check_resume(local_path, file_info.size);
-        if resume == file_info.size {
-            println!("文件已存在，跳过: {}", local_path);
-            return Ok(());
-        }
-        let new_bytes = self.download_from_url(dlink, local_path, file_info.size, resume).await?;
-        if resume > 0 {
-            println!("下载完成: {} {} (续传 {})", local_path, format_size(resume + new_bytes), format_size(resume));
-        } else {
-            println!("下载成功: {} ({} 已写入)", local_path, format_size(new_bytes));
-        }
-        Ok(())
-    }
-
-    /// 递归下载远程目录（增量：跳过本地已有且大小相同的文件）
-    pub async fn download_dir(&self, remote_dir: &str, local_dir: &str) -> anyhow::Result<()> {
-        let all_entries = self.recursive_list(remote_dir).await?;
-        let files: Vec<_> = all_entries.iter().filter(|f| f.isdir == 0).collect();
-
-        if files.is_empty() {
-            println!("目录为空，没有文件可下载");
-            return Ok(());
-        }
-
-        // 预扫描本地文件，统计增量信息
-        let mut skip_count = 0u64;
-        let mut skip_size = 0u64;
-        let mut new_count = 0u64;
-        let mut new_size = 0u64;
-        for file_info in &files {
-            let rel_path = file_info.path.strip_prefix(remote_dir).unwrap_or(&file_info.path);
-            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
-            let local_file_path = Path::new(local_dir).join(rel_path);
-            let lp = local_file_path.to_str().unwrap();
-            let resume = check_resume(lp, file_info.size);
-            if resume == file_info.size {
-                skip_count += 1;
-                skip_size += file_info.size;
-            } else {
-                new_count += 1;
-                new_size += file_info.size;
-            }
-        }
-
-        if new_count == 0 {
-            println!("共 {} 个文件，全部已存在本地，无需下载", files.len());
-            return Ok(());
-        }
-
-        println!(
-            "共 {} 个文件，{} 个已存在本地（{}），将下载 {} 个新文件（{}）",
-            files.len(),
-            skip_count,
-            format_size(skip_size),
-            new_count,
-            format_size(new_size),
-        );
-
-        let mut downloaded = 0u64;
-        for (i, file_info) in files.iter().enumerate() {
-            let rel_path = file_info.path.strip_prefix(remote_dir)
-                .unwrap_or(&file_info.path);
-            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
-            let local_file_path = Path::new(local_dir).join(rel_path);
-
-            let lp = local_file_path.to_str().unwrap();
-            let resume = check_resume(lp, file_info.size);
-            if resume == file_info.size {
-                continue;
-            }
-
-            println!("[{}/{}] 下载: {} -> {}",
-                i + 1, files.len(),
-                file_info.path,
-                local_file_path.display()
-            );
-
-            let metas = self.get_file_metas(&[file_info.fs_id]).await?;
-            let file_meta = metas.list.first()
-                .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            self.download_from_url(&file_meta.dlink, lp, file_info.size, resume).await?;
-            downloaded += 1;
-        }
-
-        println!("下载完成: 已下载 {} 个新文件，跳过 {} 个已有文件", downloaded, skip_count);
-        Ok(())
-    }
-
-    /// 多线程下载单个远程文件
-    pub async fn download_file_mt(
+    /// 统一下载入口：根据 DownloadOptions 选择单线程/多线程
+    async fn download_from_url_auto(
         &self,
-        remote_path: &str,
+        dlink: &str,
         local_path: &str,
-        num_threads: usize,
-    ) -> anyhow::Result<()> {
-        let p = Path::new(remote_path);
-        let parent_dir = p.parent().and_then(|x| x.to_str()).unwrap_or("/");
-        let filename = p.file_name().and_then(|x| x.to_str()).unwrap_or("");
-
-        let file_list = self.list_files_in_dir(parent_dir).await?;
-        let file_info = file_list.list.as_ref()
-            .and_then(|files| files.iter().find(|f| f.server_filename == filename))
-            .ok_or_else(|| anyhow!("未找到远程文件: {}", remote_path))?;
-
-        if file_info.isdir == 1 {
-            return Err(anyhow!("{} 是目录，请使用 mget -r <目录> 下载", remote_path));
+        file_size: u64,
+        opts: DownloadOptions,
+    ) -> anyhow::Result<u64> {
+        if opts.num_threads <= 1 || file_size.saturating_sub(opts.resume) < MULTITHREAD_MIN_SIZE {
+            self.download_from_url(dlink, local_path, file_size, opts.resume).await
+        } else {
+            self.download_from_url_multithreaded(dlink, local_path, file_size, opts.num_threads, opts.resume).await
         }
+    }
 
-        let metas = self.get_file_metas(&[file_info.fs_id]).await?;
-        let file_meta = metas.list.first()
-            .ok_or_else(|| anyhow!("获取下载链接失败"))?;
+    /// 下载单个文件（单线程），通过远程路径
+    pub async fn download_file(&self, remote_path: &str, local_path: &str) -> anyhow::Result<()> {
+        self.download_file_with_opts(remote_path, local_path, DownloadOptions::single(0)).await
+    }
 
-        let resume = check_resume(local_path, file_info.size);
-        if resume == file_info.size {
+    /// 多线程下载单个文件
+    pub async fn download_file_mt(&self, remote_path: &str, local_path: &str, num_threads: usize) -> anyhow::Result<()> {
+        let resume = check_resume(local_path, 0);
+        self.download_file_with_opts(remote_path, local_path, DownloadOptions::multi(resume, num_threads)).await
+    }
+
+    /// 统一的单文件下载
+    async fn download_file_with_opts(&self, remote_path: &str, local_path: &str, opts: DownloadOptions) -> anyhow::Result<()> {
+        let (file_meta, file_size) = self.resolve_download_link(remote_path).await?;
+
+        let resume = if opts.resume > 0 {
+            opts.resume
+        } else {
+            check_resume(local_path, file_size)
+        };
+
+        if resume == file_size {
             println!("文件已存在，跳过: {}", local_path);
             return Ok(());
         }
-        let new_bytes = self.download_from_url_multithreaded(
-            &file_meta.dlink, local_path, file_info.size, num_threads, resume,
-        ).await?;
+
+        let mut opts = opts;
+        opts.resume = resume;
+
+        let new_bytes = self.download_from_url_auto(&file_meta.dlink, local_path, file_size, opts).await?;
         let total = resume + new_bytes;
         if resume > 0 {
             println!("下载完成: {} {} (续传 {})", local_path, format_size(total), format_size(resume));
         } else {
-            println!("下载成功: {} ({} 已写入)", local_path, format_size(new_bytes));
+            println!("下载成功: {} ({})", local_path, format_size(new_bytes));
         }
         Ok(())
     }
 
-    /// 多线程递归下载远程目录（增量：跳过本地已有且大小相同的文件）
-    pub async fn download_dir_mt(
-        &self,
-        remote_dir: &str,
-        local_dir: &str,
-        num_threads: usize,
-    ) -> anyhow::Result<()> {
+    /// 递归下载远程目录（单线程，增量）
+    pub async fn download_dir(&self, remote_dir: &str, local_dir: &str) -> anyhow::Result<()> {
+        self.download_dir_with_opts(remote_dir, local_dir, DownloadOptions::single(0)).await
+    }
+
+    /// 多线程递归下载远程目录（增量）
+    pub async fn download_dir_mt(&self, remote_dir: &str, local_dir: &str, num_threads: usize) -> anyhow::Result<()> {
+        self.download_dir_with_opts(remote_dir, local_dir, DownloadOptions::multi(0, num_threads)).await
+    }
+
+    /// 统一的目录下载
+    async fn download_dir_with_opts(&self, remote_dir: &str, local_dir: &str, opts: DownloadOptions) -> anyhow::Result<()> {
         let all_entries = self.recursive_list(remote_dir).await?;
         let files: Vec<_> = all_entries.iter().filter(|f| f.isdir == 0).collect();
 
@@ -714,7 +412,7 @@ impl BaiduApiClient {
             return Ok(());
         }
 
-        // 预扫描本地文件，统计增量信息
+        // 预扫描
         let mut skip_count = 0u64;
         let mut skip_size = 0u64;
         let mut new_count = 0u64;
@@ -741,38 +439,29 @@ impl BaiduApiClient {
 
         println!(
             "共 {} 个文件，{} 个已存在本地（{}），将下载 {} 个新文件（{}）",
-            files.len(),
-            skip_count,
-            format_size(skip_size),
-            new_count,
-            format_size(new_size),
+            files.len(), skip_count, format_size(skip_size), new_count, format_size(new_size),
         );
 
         let mut downloaded = 0u64;
+        let total = files.len();
         for (i, file_info) in files.iter().enumerate() {
-            let rel_path = file_info.path.strip_prefix(remote_dir)
-                .unwrap_or(&file_info.path);
+            let rel_path = file_info.path.strip_prefix(remote_dir).unwrap_or(&file_info.path);
             let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
             let local_file_path = Path::new(local_dir).join(rel_path);
-
             let lp = local_file_path.to_str().unwrap();
-            let resume = check_resume(lp, file_info.size);
-            if resume == file_info.size {
+
+            let mut file_opts = opts;
+            file_opts.resume = check_resume(lp, file_info.size);
+            if file_opts.resume == file_info.size {
                 continue;
             }
 
-            println!("[{}/{}] 下载: {} -> {}",
-                i + 1, files.len(),
-                file_info.path,
-                local_file_path.display()
-            );
+            println!("[{}/{}] 下载: {} -> {}", i + 1, total, file_info.path, local_file_path.display());
 
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            self.download_from_url_multithreaded(
-                &file_meta.dlink, lp, file_info.size, num_threads, resume,
-            ).await?;
+            self.download_from_url_auto(&file_meta.dlink, lp, file_info.size, file_opts).await?;
             downloaded += 1;
         }
 
@@ -780,47 +469,215 @@ impl BaiduApiClient {
         Ok(())
     }
 
-    /// 关键字搜索文件
-    pub async fn search_files_by_keyword(
-        &self,
-        key: &str,
-        dir: Option<&str>,
-        recursion: bool,
-    ) -> anyhow::Result<SearchFileByKeywordResponse> {
+    // ---- 上传 ----
+
+    pub async fn precreate(&self, path: &str, size: u64, block_list: &str) -> anyhow::Result<PrecreateResponse> {
+        let url = self.api_url("/xpan/file?method=precreate");
+        let body = format!(
+            "path={}&size={}&isdir=0&block_list={}&autoinit=1&rtype=1",
+            urlencoding::encode(path), size, urlencoding::encode(block_list),
+        );
+        let result: PrecreateResponse = self.post_form(&url, body).await?;
+        Self::check(result, "预上传失败")
+    }
+
+    pub async fn locate_upload(&self, path: &str, uploadid: &str) -> anyhow::Result<String> {
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "{}/file?method=locateupload&appid=250528&access_token={}&path={}&uploadid={}&upload_version=2.0",
+            D_PCS_BAIDU_BASE, self.session.access_token, encoded_path, uploadid
+        );
+        let result: LocateUploadResponse = self.get_json(&url).await?;
+        let result = Self::check(result, "获取上传域名失败")?;
+        if let Some(servers) = &result.servers {
+            for s in servers {
+                if s.server.starts_with("https://") {
+                    return Ok(s.server.clone());
+                }
+            }
+            if let Some(first) = servers.first() {
+                return Ok(first.server.clone());
+            }
+        }
+        Err(anyhow!("未获取到可用的上传域名"))
+    }
+
+    pub async fn upload_chunk(
+        &self, domain: &str, path: &str, uploadid: &str, partseq: i32, data: Vec<u8>,
+    ) -> anyhow::Result<String> {
+        let encoded_path = urlencoding::encode(path);
+        let url = format!(
+            "{}/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
+            domain, self.session.access_token, encoded_path, uploadid, partseq
+        );
+
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name("blob")
+            .mime_str("application/octet-stream")
+            .context("设置 MIME 类型失败")?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let response = self.client.post(&url)
+            .multipart(form)
+            .send()
+            .await?;
+        let status = response.status();
+        let body_text = response.text().await?;
+        if !status.is_success() {
+            return Err(anyhow!("分片上传HTTP错误: status={}, body={}", status, body_text));
+        }
+        let result: UploadChunkResponse = serde_json::from_str(&body_text)
+            .map_err(|e| anyhow!("解析分片上传响应失败: {}, body={}", e, body_text))?;
+        if !result.is_success() {
+            return Err(anyhow!("分片上传失败: {}, body={}", result.error_desc(), body_text));
+        }
+        Ok(result.md5.unwrap_or_default())
+    }
+
+    pub async fn create_file(&self, path: &str, size: u64, block_list: &str, uploadid: &str) -> anyhow::Result<CreateFileResponse> {
+        let url = self.api_url("/xpan/file?method=create");
+        let body = format!(
+            "path={}&size={}&isdir=0&block_list={}&uploadid={}&rtype=1",
+            urlencoding::encode(path), size, urlencoding::encode(block_list), urlencoding::encode(uploadid),
+        );
+        let result: CreateFileResponse = self.post_form(&url, body).await?;
+        Self::check(result, "创建文件失败")
+    }
+
+    pub async fn upload_file(&self, local_path: &str, remote_filename: Option<&str>) -> anyhow::Result<()> {
+        let local_file_path = Path::new(local_path);
+        if !local_file_path.exists() {
+            return Err(anyhow!("本地文件不存在: {}", local_path));
+        }
+        if !local_file_path.is_file() {
+            return Err(anyhow!("不是一个文件: {}", local_path));
+        }
+
+        let filename = remote_filename.unwrap_or_else(|| {
+            local_file_path.file_name().unwrap().to_str().unwrap()
+        });
+
+        let remote_path = if self.session.current_remote_path.ends_with('/') {
+            format!("{}{}", self.session.current_remote_path, filename)
+        } else {
+            format!("{}/{}", self.session.current_remote_path, filename)
+        };
+
+        println!("上传文件: {} -> {}", local_path, remote_path);
+
+        let (file_size, block_list, chunk_count) = compute_block_list(local_path)?;
+        println!("文件大小: {}, 分片数: {}", format_size(file_size), chunk_count);
+
+        println!("[1/3] 预上传...");
+        let precreate_result = self.precreate(&remote_path, file_size, &block_list).await?;
+        let uploadid = precreate_result.uploadid.context("预上传未返回uploadid")?;
+        let chunks_to_upload = precreate_result.block_list.unwrap_or_else(|| vec![0]);
+        println!("uploadid: {}", uploadid);
+
+        println!("[2/3] 获取上传域名...");
+        let domain = self.locate_upload(&remote_path, &uploadid).await?;
+        println!("上传域名: {}", domain);
+
+        let total_chunks = chunks_to_upload.len();
+        for (i, &chunk_idx) in chunks_to_upload.iter().enumerate() {
+            let progress = format!("{}/{}", i + 1, total_chunks);
+            println!("[2/3] 上传分片 {} (index={})...", progress, chunk_idx);
+            let chunk_data = read_chunk(local_path, chunk_idx as usize)?;
+            let chunk_md5 = self.upload_chunk(&domain, &remote_path, &uploadid, chunk_idx, chunk_data).await?;
+            println!("  分片 {} md5: {}", chunk_idx, chunk_md5);
+        }
+
+        println!("[3/3] 创建文件...");
+        let result = self.create_file(&remote_path, file_size, &block_list, &uploadid).await?;
+        println!("上传成功!");
+        println!("  文件名: {}", result.server_filename.as_deref().unwrap_or(filename));
+        println!("  路径: {}", result.path.as_deref().unwrap_or(&remote_path));
+        println!("  大小: {}", format_size(result.size.unwrap_or(file_size)));
+        println!("  fs_id: {}", result.fs_id.unwrap_or(0));
+
+        Ok(())
+    }
+
+    // ---- 文件管理 ----
+
+    pub async fn filemanager(&self, opera: &str, filelist: &str) -> anyhow::Result<FileManagerResponse> {
+        let url = format!(
+            "{}&opera={}&async=0",
+            self.api_url("/xpan/file?method=filemanager"), opera
+        );
+        let body = format!("filelist={}", urlencoding::encode(filelist));
+        let result: FileManagerResponse = self.post_form(&url, body).await?;
+        let result = Self::check(result, "文件操作失败")?;
+        if let Some(ref info) = result.info {
+            for item in info {
+                if item.errno != 0 {
+                    return Err(anyhow!("文件 {} 操作失败: errno={}", item.path.as_deref().unwrap_or("?"), item.errno));
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn rename_file(&self, path: &str, newname: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[serde_json::json!({
+            "path": path,
+            "newname": newname
+        })])?;
+        self.filemanager("rename", &filelist).await?;
+        Ok(())
+    }
+
+    pub async fn copy_file(&self, path: &str, dest: &str, newname: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[serde_json::json!({
+            "path": path,
+            "dest": dest,
+            "newname": newname
+        })])?;
+        self.filemanager("copy", &filelist).await?;
+        Ok(())
+    }
+
+    pub async fn delete_file(&self, path: &str) -> anyhow::Result<()> {
+        let filelist = serde_json::to_string(&[path])?;
+        self.filemanager("delete", &filelist).await?;
+        Ok(())
+    }
+
+    pub async fn create_remote_dir(&self, path: &str) -> anyhow::Result<CreateFileResponse> {
+        let url = self.api_url("/xpan/file?method=create");
+        let body = format!("path={}&isdir=1&rtype=0", urlencoding::encode(path));
+        let result: CreateFileResponse = self.post_form(&url, body).await?;
+        Self::check(result, "创建远程目录失败")
+    }
+
+    // ---- 搜索 ----
+
+    pub async fn search_files_by_keyword(&self, key: &str, dir: Option<&str>, recursion: bool) -> anyhow::Result<SearchFileByKeywordResponse> {
         let encoded_key = urlencoding::encode(key);
         let mut url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=search&access_token={}&key={}",
-            self.access_token, encoded_key
+            "{}/xpan/file?method=search&access_token={}&key={}",
+            PAN_BAIDU_API_BASE, self.session.access_token, encoded_key
         );
         if let Some(d) = dir {
             url.push_str(&format!("&dir={}", urlencoding::encode(d)));
         } else {
-            url.push_str(&format!("&dir={}", urlencoding::encode(&self.current_remote_path)));
+            url.push_str(&format!("&dir={}", urlencoding::encode(&self.session.current_remote_path)));
         }
         if recursion {
             url.push_str("&recursion=1");
         }
         let response = self.client.get(&url)
-            .header("User-Agent", "pan.baidu.com")
+            .header("User-Agent", USER_AGENT)
             .send().await?;
         let result: SearchFileByKeywordResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("关键字搜索失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
-        }
-        Ok(result)
+        Self::check(result, "关键字搜索失败")
     }
 
-    /// 语义搜索文件
-    pub async fn search_files_semantic(
-        &self,
-        query: &str,
-        search_type: i32,
-        dir: Option<&str>,
-    ) -> anyhow::Result<SearchFileBySemanticResponse> {
-        let dir_val = dir.unwrap_or(&self.current_remote_path);
+    pub async fn search_files_semantic(&self, query: &str, search_type: i32, dir: Option<&str>) -> anyhow::Result<SearchFileBySemanticResponse> {
+        let dir_val = dir.unwrap_or(&self.session.current_remote_path);
         let url = format!(
             "https://pan.baidu.com/xpan/unisearch?access_token={}&scene=mcpserver&query={}&search_type={}&num=500&dir={}",
-            self.access_token,
+            self.session.access_token,
             urlencoding::encode(query),
             search_type,
             urlencoding::encode(dir_val),
@@ -830,61 +687,29 @@ impl BaiduApiClient {
             .body("{}")
             .send().await?;
         let result: SearchFileBySemanticResponse = response.json().await?;
-        if result.error_no != 0 {
-            return Err(anyhow!("语义搜索失败: error_no={}, error_msg={:?}", result.error_no, result.error_msg));
-        }
-        Ok(result)
+        Self::check(result, "语义搜索失败")
     }
 
-    /// 获取网盘容量信息
     pub async fn get_capacity_info(&self) -> anyhow::Result<CapacityInfoResponse> {
         let url = format!(
             "https://pan.baidu.com/api/quota?access_token={}",
-            self.access_token
+            self.session.access_token
         );
-        let response = self.client.get(&url).send().await?;
-        let result: CapacityInfoResponse = response.json().await?;
-        if result.errno != 0 {
-            return Err(anyhow!("获取容量信息失败: errno={}", result.errno));
-        }
-        Ok(result)
-    }
-
-    /// 创建远程目录
-    pub async fn create_remote_dir(&self, path: &str) -> anyhow::Result<CreateFileResponse> {
-        let url = format!(
-            "https://pan.baidu.com/rest/2.0/xpan/file?method=create&access_token={}",
-            self.access_token
-        );
-        let body = format!(
-            "path={}&isdir=1&rtype=0",
-            urlencoding::encode(path),
-        );
-        let response = self.client.post(&url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(body)
-            .send().await?;
-        let result: CreateFileResponse = response.json().await?;
-        if result.base.errno != 0 {
-            return Err(anyhow!("创建远程目录失败: errno={}, errmsg={:?}", result.base.errno, result.base.errmsg));
-        }
-        Ok(result)
+        let result: CapacityInfoResponse = self.get_json(&url).await?;
+        Self::check(result, "获取容量信息失败")
     }
 }
 
 // ==================== 上传辅助函数 ====================
 
-/// 计算数据的MD5
 fn compute_file_md5(data: &[u8]) -> String {
     format!("{:x}", md5::compute(data))
 }
 
-/// 计算文件的 block_list（每个4MB分片的MD5数组的JSON字符串），返回 (文件大小, block_list_json)
 fn compute_block_list(file_path: &str) -> anyhow::Result<(u64, String, usize)> {
     let mut file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
 
-    const CHUNK_SIZE: usize = 4 * 1024 * 1024; // 4MB
     let mut md5s: Vec<String> = Vec::new();
     let mut buffer = vec![0u8; CHUNK_SIZE];
 
@@ -896,7 +721,6 @@ fn compute_block_list(file_path: &str) -> anyhow::Result<(u64, String, usize)> {
         md5s.push(compute_file_md5(&buffer[..bytes_read]));
     }
 
-    // 空文件发送一个空的MD5
     if md5s.is_empty() {
         md5s.push(compute_file_md5(&[]));
     }
@@ -905,20 +729,16 @@ fn compute_block_list(file_path: &str) -> anyhow::Result<(u64, String, usize)> {
     Ok((file_size, block_list_str, md5s.len()))
 }
 
-/// 读取文件的指定分片（0-indexed，每片4MB）
 fn read_chunk(file_path: &str, chunk_index: usize) -> anyhow::Result<Vec<u8>> {
     let mut file = File::open(file_path)?;
-    const CHUNK_SIZE: u64 = 4 * 1024 * 1024;
-    let offset = chunk_index as u64 * CHUNK_SIZE;
+    let offset = chunk_index as u64 * CHUNK_SIZE_U64;
     file.seek(SeekFrom::Start(offset))?;
-    let mut buffer = vec![0u8; CHUNK_SIZE as usize];
+    let mut buffer = vec![0u8; CHUNK_SIZE];
     let bytes_read = file.read(&mut buffer)?;
     buffer.truncate(bytes_read);
     Ok(buffer)
 }
 
-/// 检查本地文件是否存在，返回已下载的字节数用于续传
-/// 优先检查 .bftp_part 进度文件（多线程下载），其次检查文件大小（单线程下载）
 fn check_resume(local_path: &str, remote_size: u64) -> u64 {
     let progress_path = format!("{}.bftp_part", local_path);
     if let Ok(mut f) = File::open(&progress_path) {
@@ -933,7 +753,6 @@ fn check_resume(local_path: &str, remote_size: u64) -> u64 {
         }
         std::fs::remove_file(&progress_path).ok();
     }
-    // 无进度文件时，用文件大小判断（单线程下载未预分配）
     match std::fs::metadata(local_path) {
         Ok(meta) if meta.is_file() => {
             let local_size = meta.len();

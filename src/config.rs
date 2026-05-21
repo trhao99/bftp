@@ -8,19 +8,19 @@ pub struct UserToken {
     #[serde(default)]
     pub access_token: String,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub response_type: String,
     pub client_id: String,
     pub redirect_uri: String,
     pub scope: String,
     pub default: String,
     pub users: HashMap<String, UserToken>,
 }
+
 impl Default for Config {
     fn default() -> Self {
         Self {
-            response_type: "token".to_string(),
             client_id: String::new(),
             redirect_uri: "oob".to_string(),
             scope: "basic,netdisk".to_string(),
@@ -29,6 +29,7 @@ impl Default for Config {
         }
     }
 }
+
 impl Config {
     /// 获取默认配置文件路径
     pub fn get_default_path() -> anyhow::Result<PathBuf> {
@@ -38,28 +39,18 @@ impl Config {
         Ok(PathBuf::from(home).join(".bftp").join("config.json"))
     }
 
-    /// 获取指定用户的 token，如果用户不存在则创建
-    pub fn get_or_create_user_token(&mut self, username: &str) -> String {
-        if let Some(user) = self.users.get_mut(username) {
+    /// 获取或创建用户并返回其 token（会保存配置）
+    pub fn get_or_create_user_token_mut(&mut self, username: &str) -> String {
+        if let Some(user) = self.users.get(username) {
             user.access_token.clone()
         } else {
-            // 创建新用户，token 为空字符串
             self.users.insert(
                 username.to_string(),
-                UserToken {
-                    access_token: String::new(),
-                },
+                UserToken { access_token: String::new() },
             );
-            // 保存配置
             let _ = self.save_default();
             String::new()
         }
-    }
-
-    /// 获取默认用户的 token，如果默认用户不存在则创建
-    pub fn get_or_create_default_token(&mut self) -> String {
-        let default_user = self.default.clone();
-        self.get_or_create_user_token(&default_user)
     }
 
     /// 从指定路径读取配置文件，若文件不存在则创建默认配置
@@ -88,7 +79,6 @@ impl Config {
         }
         let content = serde_json::to_string_pretty(self)?;
         fs::write(path, content)?;
-        // 设置文件权限为 600（仅所有者可读写）
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -103,15 +93,9 @@ impl Config {
         self.save_to_path(&config_path)
     }
 
-    /// 获取当前默认用户的 access_token
-    #[allow(dead_code)]
-    pub fn get_default_token(&self) -> Option<&String> {
-        self.users.get(&self.default).map(|user| &user.access_token)
-    }
-
     /// 获取指定用户的 access_token
     pub fn get_user_token(&self, username: &str) -> Option<&String> {
-        self.users.get(username).map(|user| &user.access_token)
+        self.users.get(username).map(|u| &u.access_token)
     }
 
     /// 设置指定用户的 access_token
@@ -121,9 +105,7 @@ impl Config {
         } else {
             self.users.insert(
                 username.to_string(),
-                UserToken {
-                    access_token: token,
-                },
+                UserToken { access_token: token },
             );
         }
     }
@@ -143,7 +125,6 @@ impl Config {
         if self.client_id.is_empty() {
             return Err("client_id 不能为空, 请参照 https://pan.baidu.com/union/doc/Bl0eta7z8 文档进行应用接入".to_string());
         }
-
         Ok(())
     }
 
@@ -151,22 +132,18 @@ impl Config {
     pub fn add_user(&mut self, username: &str, token: Option<String>) {
         self.users.insert(
             username.to_string(),
-            UserToken {
-                access_token: token.unwrap_or_default(),
-            },
+            UserToken { access_token: token.unwrap_or_default() },
         );
     }
 
     /// 移除用户
     pub fn remove_user(&mut self, username: &str) -> Option<UserToken> {
         let result = self.users.remove(username);
-
-        if self.default == username && !self.users.is_empty() {
-            if let Some(first_user) = self.users.keys().next() {
-                self.default = first_user.clone();
-            }
+        if self.default == username && !self.users.is_empty()
+            && let Some(first_user) = self.users.keys().next()
+        {
+            self.default = first_user.clone();
         }
-
         result
     }
 

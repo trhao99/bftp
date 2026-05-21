@@ -76,15 +76,15 @@ pub fn print_semantic_search_results(response: &SearchFileBySemanticResponse) {
                 let type_name = format!("{:8}", file.category.display());
                 println!("{} {:>8} {} {} [{}] {}",
                     file_type, size_str, time_str, type_name, source_name, file.path);
-                if let Some(ref c) = file.content {
-                    if !c.is_empty() {
-                        println!("  -> {}", c);
-                    }
+                if let Some(ref c) = file.content
+                    && !c.is_empty()
+                {
+                    println!("  -> {}", c);
                 }
-                if let Some(ref o) = file.ocr {
-                    if !o.is_empty() {
-                        println!("  -> OCR: {}", o);
-                    }
+                if let Some(ref o) = file.ocr
+                    && !o.is_empty()
+                {
+                    println!("  -> OCR: {}", o);
                 }
             }
         }
