@@ -700,7 +700,8 @@ impl BaiduApiClient {
     pub async fn search_files_semantic(&self, query: &str, search_type: i32, dir: Option<&str>) -> anyhow::Result<SearchFileBySemanticResponse> {
         let dir_val = dir.unwrap_or(&self.session.current_remote_path);
         let url = format!(
-            "https://pan.baidu.com/xpan/unisearch?access_token={}&scene=mcpserver&query={}&search_type={}&num=500&dir={}",
+            "{}/xpan/unisearch?access_token={}&scene=mcpserver&query={}&search_type={}&num=500&dir={}",
+            PAN_BAIDU_API_BASE,
             self.session.access_token,
             urlencoding::encode(query),
             search_type,
@@ -716,7 +717,8 @@ impl BaiduApiClient {
 
     pub async fn get_capacity_info(&self) -> anyhow::Result<CapacityInfoResponse> {
         let url = format!(
-            "https://pan.baidu.com/api/quota?access_token={}",
+            "{}/api/quota?access_token={}",
+            PAN_BAIDU_HOST,
             self.session.access_token
         );
         let result: CapacityInfoResponse = self.get_json(&url).await?;

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 
 use crate::client::BaiduApiClient;
 use crate::config::Config;
-use crate::constants::OAUTH_SCOPE;
+use crate::constants::{OAUTH_AUTHORIZE_URL, OAUTH_SCOPE};
 
 /// 从回调URL片段中提取access_token
 fn extract_access_token(callback_url: &str) -> anyhow::Result<String> {
@@ -35,8 +35,8 @@ pub async fn start_implicit_grant_flow(
 
     // 构建授权URL
     let auth_url = format!(
-        "https://openapi.baidu.com/oauth/2.0/authorize?response_type=token&client_id={}&redirect_uri={}&scope={}",
-        client_id, redirect_uri, OAUTH_SCOPE
+        "{}?response_type=token&client_id={}&redirect_uri={}&scope={}",
+        OAUTH_AUTHORIZE_URL, client_id, redirect_uri, OAUTH_SCOPE
     );
 
     println!("\n1. 请在浏览器中打开以下URL：");
@@ -58,10 +58,7 @@ pub async fn start_implicit_grant_flow(
 }
 
 /// 完整的token验证和刷新流程
-pub async fn ensure_valid_token(
-    config: &mut Config,
-    username: &str,
-) -> anyhow::Result<String> {
+pub async fn ensure_valid_token(config: &mut Config, username: &str) -> anyhow::Result<String> {
     // 获取当前token
     let current_token = {
         if let Some(token) = config.get_user_token(username) {

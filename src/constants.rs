@@ -1,3 +1,9 @@
+///百度网盘应用接入文档
+pub const PAN_BAIDU_APP_HELP_URL: &str = "https://pan.baidu.com/union/doc/Bl0eta7z8";
+
+/// 百度网盘HOST
+pub const PAN_BAIDU_HOST: &str = "https://pan.baidu.com";
+
 /// 百度网盘 API 基础 URL
 pub const PAN_BAIDU_API_BASE: &str = "https://pan.baidu.com/rest/2.0";
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::constants::OAUTH_SCOPE;
+use crate::constants::{OAUTH_SCOPE, PAN_BAIDU_APP_HELP_URL};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserToken {
@@ -125,7 +125,7 @@ impl Config {
     /// 验证配置是否完整
     pub fn validate(&self) -> Result<(), String> {
         if self.client_id.is_empty() {
-            return Err("client_id 不能为空, 请参照 https://pan.baidu.com/union/doc/Bl0eta7z8 文档进行应用接入".to_string());
+            return Err(format!("client_id 不能为空, 请参照 {} 文档进行应用接入", PAN_BAIDU_APP_HELP_URL));
         }
         Ok(())
     }
