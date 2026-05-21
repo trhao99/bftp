@@ -584,7 +584,7 @@ impl BaiduApiClient {
         Ok(())
     }
 
-    /// 递归下载远程目录
+    /// 递归下载远程目录（增量：跳过本地已有且大小相同的文件）
     pub async fn download_dir(&self, remote_dir: &str, local_dir: &str) -> anyhow::Result<()> {
         let all_entries = self.recursive_list(remote_dir).await?;
         let files: Vec<_> = all_entries.iter().filter(|f| f.isdir == 0).collect();
@@ -594,14 +594,52 @@ impl BaiduApiClient {
             return Ok(());
         }
 
-        println!("共 {} 个文件待下载", files.len());
+        // 预扫描本地文件，统计增量信息
+        let mut skip_count = 0u64;
+        let mut skip_size = 0u64;
+        let mut new_count = 0u64;
+        let mut new_size = 0u64;
+        for file_info in &files {
+            let rel_path = file_info.path.strip_prefix(remote_dir).unwrap_or(&file_info.path);
+            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+            let local_file_path = Path::new(local_dir).join(rel_path);
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                skip_count += 1;
+                skip_size += file_info.size;
+            } else {
+                new_count += 1;
+                new_size += file_info.size;
+            }
+        }
 
+        if new_count == 0 {
+            println!("共 {} 个文件，全部已存在本地，无需下载", files.len());
+            return Ok(());
+        }
+
+        println!(
+            "共 {} 个文件，{} 个已存在本地（{}），将下载 {} 个新文件（{}）",
+            files.len(),
+            skip_count,
+            format_size(skip_size),
+            new_count,
+            format_size(new_size),
+        );
+
+        let mut downloaded = 0u64;
         for (i, file_info) in files.iter().enumerate() {
-            // 将远程路径映射到本地路径
             let rel_path = file_info.path.strip_prefix(remote_dir)
                 .unwrap_or(&file_info.path);
             let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
             let local_file_path = Path::new(local_dir).join(rel_path);
+
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                continue;
+            }
 
             println!("[{}/{}] 下载: {} -> {}",
                 i + 1, files.len(),
@@ -612,16 +650,11 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            let lp = local_file_path.to_str().unwrap();
-            let resume = check_resume(lp, file_info.size);
-            if resume == file_info.size {
-                println!("[{}/{}] 文件已存在，跳过: {}", i + 1, files.len(), lp);
-                continue;
-            }
             self.download_from_url(&file_meta.dlink, lp, file_info.size, resume).await?;
+            downloaded += 1;
         }
 
-        println!("下载完成: {} 个文件", files.len());
+        println!("下载完成: 已下载 {} 个新文件，跳过 {} 个已有文件", downloaded, skip_count);
         Ok(())
     }
 
@@ -666,7 +699,7 @@ impl BaiduApiClient {
         Ok(())
     }
 
-    /// 多线程递归下载远程目录
+    /// 多线程递归下载远程目录（增量：跳过本地已有且大小相同的文件）
     pub async fn download_dir_mt(
         &self,
         remote_dir: &str,
@@ -681,13 +714,52 @@ impl BaiduApiClient {
             return Ok(());
         }
 
-        println!("共 {} 个文件待下载", files.len());
+        // 预扫描本地文件，统计增量信息
+        let mut skip_count = 0u64;
+        let mut skip_size = 0u64;
+        let mut new_count = 0u64;
+        let mut new_size = 0u64;
+        for file_info in &files {
+            let rel_path = file_info.path.strip_prefix(remote_dir).unwrap_or(&file_info.path);
+            let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
+            let local_file_path = Path::new(local_dir).join(rel_path);
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                skip_count += 1;
+                skip_size += file_info.size;
+            } else {
+                new_count += 1;
+                new_size += file_info.size;
+            }
+        }
 
+        if new_count == 0 {
+            println!("共 {} 个文件，全部已存在本地，无需下载", files.len());
+            return Ok(());
+        }
+
+        println!(
+            "共 {} 个文件，{} 个已存在本地（{}），将下载 {} 个新文件（{}）",
+            files.len(),
+            skip_count,
+            format_size(skip_size),
+            new_count,
+            format_size(new_size),
+        );
+
+        let mut downloaded = 0u64;
         for (i, file_info) in files.iter().enumerate() {
             let rel_path = file_info.path.strip_prefix(remote_dir)
                 .unwrap_or(&file_info.path);
             let rel_path = rel_path.strip_prefix('/').unwrap_or(rel_path);
             let local_file_path = Path::new(local_dir).join(rel_path);
+
+            let lp = local_file_path.to_str().unwrap();
+            let resume = check_resume(lp, file_info.size);
+            if resume == file_info.size {
+                continue;
+            }
 
             println!("[{}/{}] 下载: {} -> {}",
                 i + 1, files.len(),
@@ -698,18 +770,13 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            let lp = local_file_path.to_str().unwrap();
-            let resume = check_resume(lp, file_info.size);
-            if resume == file_info.size {
-                println!("[{}/{}] 文件已存在，跳过: {}", i + 1, files.len(), lp);
-                continue;
-            }
             self.download_from_url_multithreaded(
                 &file_meta.dlink, lp, file_info.size, num_threads, resume,
             ).await?;
+            downloaded += 1;
         }
 
-        println!("下载完成: {} 个文件", files.len());
+        println!("下载完成: 已下载 {} 个新文件，跳过 {} 个已有文件", downloaded, skip_count);
         Ok(())
     }
 

@@ -751,28 +751,28 @@ pub async fn execute_command(
         }
         "lrm" => {
             if parts.len() < 2 {
-                eprintln!("用法: lrm <本地文件>");
+                eprintln!("用法: lrm <本地文件或目录>");
                 eprintln!("支持通配符: lrm *.txt");
                 return;
             }
             if has_wildcards(parts[1]) {
                 let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_local_path(), false);
-                match expand_local_wildcard_files(&dir, &pattern) {
-                    Ok(files) => {
-                        if files.is_empty() {
-                            println!("没有匹配的文件: {}", parts[1]);
+                match expand_local_wildcard_all(&dir, &pattern) {
+                    Ok(entries) => {
+                        if entries.is_empty() {
+                            println!("没有匹配的条目: {}", parts[1]);
                             return;
                         }
-                        println!("匹配到 {} 个文件:", files.len());
-                        for f in &files {
+                        println!("匹配到 {} 个条目:", entries.len());
+                        for f in &entries {
                             println!("  {}", f);
                         }
-                        if !confirm_delete_batch(files.len()) {
+                        if !confirm_delete_batch(entries.len()) {
                             println!("已取消");
                             return;
                         }
-                        for path in &files {
-                            if let Err(e) = fs::remove_file(path) {
+                        for path in &entries {
+                            if let Err(e) = remove_local_path(path) {
                                 eprintln!("删除 {} 失败: {}", path, e);
                             } else {
                                 println!("删除成功: {}", path);
@@ -787,7 +787,7 @@ pub async fn execute_command(
                     println!("已取消");
                     return;
                 }
-                if let Err(e) = fs::remove_file(&path) {
+                if let Err(e) = remove_local_path(&path) {
                     eprintln!("删除失败: {}", e);
                 } else {
                     println!("删除成功: {}", path);
@@ -998,6 +998,33 @@ fn expand_local_wildcard_files(dir: &str, pattern: &str) -> anyhow::Result<Vec<S
         }
     }
     Ok(files)
+}
+
+/// 展开本地通配符，返回匹配的所有条目（文件 + 目录）路径列表
+fn expand_local_wildcard_all(dir: &str, pattern: &str) -> anyhow::Result<Vec<String>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if glob_match(pattern, &name) {
+            entries.push(entry.path().to_string_lossy().to_string());
+        }
+    }
+    Ok(entries)
+}
+
+/// 删除本地文件或目录
+fn remove_local_path(path: &str) -> anyhow::Result<()> {
+    let p = Path::new(path);
+    if !p.exists() {
+        return Err(anyhow::anyhow!("路径不存在: {}", path));
+    }
+    if p.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// 展开远程通配符，返回匹配的文件路径列表
