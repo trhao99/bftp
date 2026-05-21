@@ -507,7 +507,7 @@ impl BaiduApiClient {
     ) -> anyhow::Result<String> {
         let encoded_path = urlencoding::encode(path);
         let url = format!(
-            "{}/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
+            "{}/rest/2.0/pcs/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
             domain, self.session.access_token, encoded_path, uploadid, partseq
         );
 
