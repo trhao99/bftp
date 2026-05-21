@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::client::BaiduApiClient;
 use crate::config::Config;
+use crate::constants::DEFAULT_THREADS;
 use crate::display::{
     format_size, format_timestamp, print_file_list, print_keyword_search_results,
     print_semantic_search_results,
@@ -88,7 +89,8 @@ pub async fn execute_command(
         return;
     }
 
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let parts = shell_split(line);
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     let command = parts[0];
 
     match command {
@@ -126,11 +128,11 @@ pub async fn execute_command(
 // ---- 导航命令 ----
 
 fn cmd_pwd(client: &BaiduApiClient) {
-    println!("{}", client.get_current_remote_path());
+    println!("{}", &client.session.current_remote_path);
 }
 
 fn cmd_lpwd(client: &BaiduApiClient) {
-    println!("{}", client.get_current_local_path());
+    println!("{}", &client.session.current_local_path);
 }
 
 async fn cmd_quota(client: &BaiduApiClient) {
@@ -156,7 +158,7 @@ async fn cmd_ls(client: &BaiduApiClient) {
 
 fn cmd_lls(client: &BaiduApiClient, parts: &[&str]) {
     let show_all = parts.len() > 1 && parts[1] == "-la";
-    let path = client.get_current_local_path();
+    let path = &client.session.current_local_path;
     match fs::read_dir(path) {
         Ok(entries) => {
             let mut dirs: Vec<_> = Vec::new();
@@ -195,8 +197,8 @@ fn cmd_cd(client: &mut BaiduApiClient, parts: &[&str]) {
         return;
     }
     let path = parts[1..].join(" ");
-    let new_path = normalize_path(client.get_current_remote_path(), &path);
-    client.set_current_remote_path(new_path);
+    let new_path = normalize_path(&client.session.current_remote_path, &path);
+    client.session.current_remote_path = new_path;
 }
 
 fn cmd_lcd(client: &mut BaiduApiClient, parts: &[&str]) {
@@ -205,13 +207,13 @@ fn cmd_lcd(client: &mut BaiduApiClient, parts: &[&str]) {
         return;
     }
     let path = parts[1..].join(" ");
-    let new_path = normalize_path(client.get_current_local_path(), &path);
+    let new_path = normalize_path(&client.session.current_local_path, &path);
     if Path::new(&new_path).exists() {
         if let Err(e) = std::env::set_current_dir(&new_path) {
             eprintln!("切换本地目录失败: {}", e);
             return;
         }
-        client.set_current_local_path(new_path);
+        client.session.current_local_path = new_path;
     } else {
         eprintln!("本地目录不存在: {}", new_path);
     }
@@ -224,7 +226,7 @@ async fn cmd_mkdir(client: &BaiduApiClient, parts: &[&str]) {
         eprintln!("用法: mkdir <目录名>");
         return;
     }
-    let path = normalize_path(client.get_current_remote_path(), parts[1]);
+    let path = normalize_path(&client.session.current_remote_path, parts[1]);
     match client.create_remote_dir(&path).await {
         Ok(result) => println!("创建远程目录成功: {}", result.path.as_deref().unwrap_or(&path)),
         Err(e) => eprintln!("创建远程目录失败: {}", e),
@@ -236,7 +238,7 @@ fn cmd_lmkdir(client: &BaiduApiClient, parts: &[&str]) {
         eprintln!("用法: lmkdir <目录名>");
         return;
     }
-    let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+    let path = resolve_local_path(&client.session.current_local_path, parts[1]);
     match fs::create_dir_all(&path) {
         Ok(()) => println!("创建本地目录成功: {}", path),
         Err(e) => eprintln!("创建本地目录失败: {}", e),
@@ -314,7 +316,7 @@ async fn cmd_rename(client: &BaiduApiClient, parts: &[&str]) {
         eprintln!("用法: rename <远程文件> <新文件名>");
         return;
     }
-    let path = normalize_path(client.get_current_remote_path(), parts[1]);
+    let path = normalize_path(&client.session.current_remote_path, parts[1]);
     let newname = parts[2];
     if let Err(e) = client.rename_file(&path, newname).await {
         eprintln!("重命名失败: {}", e);
@@ -328,9 +330,9 @@ async fn cmd_mv(client: &BaiduApiClient, parts: &[&str]) {
         eprintln!("用法: mv <源文件> <目标路径>");
         return;
     }
-    let src = normalize_path(client.get_current_remote_path(), parts[1]);
+    let src = normalize_path(&client.session.current_remote_path, parts[1]);
     let dest_arg = parts[2];
-    let (dest_dir, newname) = parse_dest_path(client.get_current_remote_path(), dest_arg, &src);
+    let (dest_dir, newname) = parse_dest_path(&client.session.current_remote_path, dest_arg, &src);
     let src_dir = Path::new(&src)
         .parent()
         .and_then(|p| p.to_str())
@@ -359,9 +361,9 @@ async fn cmd_cp(client: &BaiduApiClient, parts: &[&str]) {
         eprintln!("用法: cp <源文件> <目标路径>");
         return;
     }
-    let src = normalize_path(client.get_current_remote_path(), parts[1]);
+    let src = normalize_path(&client.session.current_remote_path, parts[1]);
     let dest_arg = parts[2];
-    let (dest_dir, newname) = parse_dest_path(client.get_current_remote_path(), dest_arg, &src);
+    let (dest_dir, newname) = parse_dest_path(&client.session.current_remote_path, dest_arg, &src);
     if let Err(e) = client.copy_file(&src, &dest_dir, &newname).await {
         eprintln!("复制失败: {}", e);
     } else {
@@ -376,7 +378,7 @@ async fn cmd_rm(client: &BaiduApiClient, parts: &[&str]) {
         return;
     }
     if has_wildcards(parts[1]) {
-        let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_remote_path(), true);
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_remote_path, true);
         match expand_remote_wildcard_files(client, &dir, &pattern, false).await {
             Ok(paths) => {
                 if paths.is_empty() {
@@ -402,7 +404,7 @@ async fn cmd_rm(client: &BaiduApiClient, parts: &[&str]) {
             Err(e) => eprintln!("展开通配符失败: {}", e),
         }
     } else {
-        let path = normalize_path(client.get_current_remote_path(), parts[1]);
+        let path = normalize_path(&client.session.current_remote_path, parts[1]);
         if !confirm_delete(&path) {
             println!("已取消");
             return;
@@ -420,33 +422,90 @@ async fn cmd_rm(client: &BaiduApiClient, parts: &[&str]) {
 fn cmd_lcp(client: &BaiduApiClient, parts: &[&str]) {
     if parts.len() < 3 {
         eprintln!("用法: lcp <源文件> <目标路径>");
+        eprintln!("支持通配符: lcp *.txt <目标目录>");
         return;
     }
-    let src = resolve_local_path(client.get_current_local_path(), parts[1]);
-    let dest = resolve_local_dest(client, &src, parts[2]);
-    if let Err(e) = fs::copy(&src, &dest) {
-        eprintln!("本地复制失败: {}", e);
+    if has_wildcards(parts[1]) {
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_local_path, false);
+        let dest_dir = resolve_local_path(&client.session.current_local_path, parts[2]);
+        match expand_local_wildcard_files(&dir, &pattern) {
+            Ok(files) => {
+                if files.is_empty() {
+                    println!("没有匹配的文件: {}", parts[1]);
+                    return;
+                }
+                println!("匹配到 {} 个文件", files.len());
+                for src in &files {
+                    let name = Path::new(src).file_name().and_then(|n| n.to_str()).unwrap_or("untitled");
+                    let dest = format!("{}/{}", dest_dir, name);
+                    if let Err(e) = fs::copy(src, &dest) {
+                        eprintln!("复制 {} 失败: {}", src, e);
+                    } else {
+                        println!("复制成功: {} -> {}", src, dest);
+                    }
+                }
+            }
+            Err(e) => eprintln!("展开通配符失败: {}", e),
+        }
     } else {
-        println!("复制成功: {} -> {}", src, dest);
+        let src = resolve_local_path(&client.session.current_local_path, parts[1]);
+        let dest = resolve_local_dest(client, &src, parts[2]);
+        if let Err(e) = fs::copy(&src, &dest) {
+            eprintln!("本地复制失败: {}", e);
+        } else {
+            println!("复制成功: {} -> {}", src, dest);
+        }
     }
 }
 
 fn cmd_lmv(client: &BaiduApiClient, parts: &[&str]) {
     if parts.len() < 3 {
         eprintln!("用法: lmv <源文件> <目标路径>");
+        eprintln!("支持通配符: lmv *.txt <目标目录>");
         return;
     }
-    let src = resolve_local_path(client.get_current_local_path(), parts[1]);
-    let dest = resolve_local_dest(client, &src, parts[2]);
-    match fs::rename(&src, &dest) {
-        Ok(()) => println!("移动成功: {} -> {}", src, dest),
-        Err(_) => {
-            if let Err(e2) = fs::copy(&src, &dest) {
-                eprintln!("移动失败: {}", e2);
-            } else if let Err(e3) = fs::remove_file(&src) {
-                eprintln!("移动警告: 文件已复制到 {}，但删除源文件失败: {}", dest, e3);
-            } else {
-                println!("移动成功: {} -> {}", src, dest);
+    if has_wildcards(parts[1]) {
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_local_path, false);
+        let dest_dir = resolve_local_path(&client.session.current_local_path, parts[2]);
+        match expand_local_wildcard_files(&dir, &pattern) {
+            Ok(files) => {
+                if files.is_empty() {
+                    println!("没有匹配的文件: {}", parts[1]);
+                    return;
+                }
+                println!("匹配到 {} 个文件", files.len());
+                for src in &files {
+                    let name = Path::new(src).file_name().and_then(|n| n.to_str()).unwrap_or("untitled");
+                    let dest = format!("{}/{}", dest_dir, name);
+                    match fs::rename(src, &dest) {
+                        Ok(()) => println!("移动成功: {} -> {}", src, dest),
+                        Err(_) => {
+                            if let Err(e2) = fs::copy(src, &dest) {
+                                eprintln!("移动 {} 失败: {}", src, e2);
+                            } else if let Err(e3) = fs::remove_file(src) {
+                                eprintln!("移动警告: 已复制到 {}，但删除源文件 {} 失败: {}", dest, src, e3);
+                            } else {
+                                println!("移动成功: {} -> {}", src, dest);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => eprintln!("展开通配符失败: {}", e),
+        }
+    } else {
+        let src = resolve_local_path(&client.session.current_local_path, parts[1]);
+        let dest = resolve_local_dest(client, &src, parts[2]);
+        match fs::rename(&src, &dest) {
+            Ok(()) => println!("移动成功: {} -> {}", src, dest),
+            Err(_) => {
+                if let Err(e2) = fs::copy(&src, &dest) {
+                    eprintln!("移动失败: {}", e2);
+                } else if let Err(e3) = fs::remove_file(&src) {
+                    eprintln!("移动警告: 文件已复制到 {}，但删除源文件失败: {}", dest, e3);
+                } else {
+                    println!("移动成功: {} -> {}", src, dest);
+                }
             }
         }
     }
@@ -459,7 +518,7 @@ fn cmd_lrm(client: &BaiduApiClient, parts: &[&str]) {
         return;
     }
     if has_wildcards(parts[1]) {
-        let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_local_path(), false);
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_local_path, false);
         match expand_local_wildcard_all(&dir, &pattern) {
             Ok(entries) => {
                 if entries.is_empty() {
@@ -485,7 +544,7 @@ fn cmd_lrm(client: &BaiduApiClient, parts: &[&str]) {
             Err(e) => eprintln!("展开通配符失败: {}", e),
         }
     } else {
-        let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+        let path = resolve_local_path(&client.session.current_local_path, parts[1]);
         if !confirm_delete(&path) {
             println!("已取消");
             return;
@@ -511,7 +570,7 @@ async fn cmd_put(client: &BaiduApiClient, parts: &[&str]) {
             eprintln!("通配符模式不支持指定远程文件名");
             return;
         }
-        let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_local_path(), false);
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_local_path, false);
         match expand_local_wildcard_files(&dir, &pattern) {
             Ok(files) => {
                 if files.is_empty() {
@@ -524,8 +583,8 @@ async fn cmd_put(client: &BaiduApiClient, parts: &[&str]) {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("unknown");
-                    println!("上传: {} -> {}/{}", name, client.get_current_remote_path(), name);
-                    if let Err(e) = client.upload_file(local_file, None).await {
+                    println!("上传: {} -> {}/{}", name, &client.session.current_remote_path, name);
+                    if let Err(e) = client.upload_file(local_file, None, Some(&|s| println!("{}", s))).await {
                         eprintln!("上传 {} 失败: {}", local_file, e);
                     }
                 }
@@ -533,9 +592,9 @@ async fn cmd_put(client: &BaiduApiClient, parts: &[&str]) {
             Err(e) => eprintln!("展开通配符失败: {}", e),
         }
     } else {
-        let local_path = resolve_local_path(client.get_current_local_path(), parts[1]);
+        let local_path = resolve_local_path(&client.session.current_local_path, parts[1]);
         let remote_filename = if parts.len() > 2 { Some(parts[2]) } else { None };
-        if let Err(e) = client.upload_file(&local_path, remote_filename).await {
+        if let Err(e) = client.upload_file(&local_path, remote_filename, Some(&|s| println!("{}", s))).await {
             eprintln!("上传失败: {}", e);
         }
     }
@@ -555,11 +614,11 @@ async fn cmd_get(client: &BaiduApiClient, parts: &[&str], recursive: bool, num_t
             return;
         }
         if has_wildcards(parts[2]) {
-            let (dir, pattern) = parse_wildcard_path(parts[2], client.get_current_remote_path(), true);
+            let (dir, pattern) = parse_wildcard_path(parts[2], &client.session.current_remote_path, true);
             let local_base = if parts.len() > 3 {
-                resolve_local_path(client.get_current_local_path(), parts[3])
+                resolve_local_path(&client.session.current_local_path, parts[3])
             } else {
-                client.get_current_local_path().to_string()
+                client.session.current_local_path.clone()
             };
             match expand_remote_wildcard_files(client, &dir, &pattern, true).await {
                 Ok(paths) => {
@@ -578,18 +637,18 @@ async fn cmd_get(client: &BaiduApiClient, parts: &[&str], recursive: bool, num_t
                 Err(e) => eprintln!("展开通配符失败: {}", e),
             }
         } else {
-            let remote_dir = normalize_path(client.get_current_remote_path(), parts[2]);
+            let remote_dir = normalize_path(&client.session.current_remote_path, parts[2]);
             let local_dir = local_dest_for_remote(client, &remote_dir, parts.get(3).copied());
             if let Err(e) = download_dir_cmd(client, &remote_dir, &local_dir, num_threads).await {
                 eprintln!("下载失败: {}", e);
             }
         }
     } else if has_wildcards(parts[1]) {
-        let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_remote_path(), true);
+        let (dir, pattern) = parse_wildcard_path(parts[1], &client.session.current_remote_path, true);
         let local_dir = if parts.len() > 2 {
-            resolve_local_path(client.get_current_local_path(), parts[2])
+            resolve_local_path(&client.session.current_local_path, parts[2])
         } else {
-            client.get_current_local_path().to_string()
+            client.session.current_local_path.clone()
         };
         match expand_remote_wildcard_files(client, &dir, &pattern, false).await {
             Ok(paths) => {
@@ -609,7 +668,7 @@ async fn cmd_get(client: &BaiduApiClient, parts: &[&str], recursive: bool, num_t
             Err(e) => eprintln!("展开通配符失败: {}", e),
         }
     } else {
-        let remote_path = normalize_path(client.get_current_remote_path(), parts[1]);
+        let remote_path = normalize_path(&client.session.current_remote_path, parts[1]);
         let local_path = local_dest_for_remote(client, &remote_path, parts.get(2).copied());
         if let Err(e) = download_file_cmd(client, &remote_path, &local_path, num_threads).await {
             eprintln!("下载失败: {}", e);
@@ -624,7 +683,7 @@ async fn cmd_mget(client: &BaiduApiClient, parts: &[&str]) {
         return;
     }
     let mut recursive = false;
-    let mut num_threads = 4usize;
+    let mut num_threads = DEFAULT_THREADS;
     let mut args_start = 1;
 
     while args_start < parts.len() {
@@ -635,7 +694,7 @@ async fn cmd_mget(client: &BaiduApiClient, parts: &[&str]) {
             }
             "-t" => {
                 if args_start + 1 < parts.len() {
-                    num_threads = parts[args_start + 1].parse().unwrap_or(4);
+                    num_threads = parts[args_start + 1].parse().unwrap_or(DEFAULT_THREADS);
                     args_start += 2;
                 } else {
                     eprintln!("用法: mget -t <线程数>");
@@ -676,20 +735,20 @@ async fn download_dir_cmd(client: &BaiduApiClient, remote_dir: &str, local_dir: 
 
 fn local_dest_for_remote(client: &BaiduApiClient, remote_path: &str, explicit_dest: Option<&str>) -> String {
     if let Some(dest) = explicit_dest {
-        resolve_local_path(client.get_current_local_path(), dest)
+        resolve_local_path(&client.session.current_local_path, dest)
     } else {
         let filename = Path::new(remote_path).file_name().and_then(|n| n.to_str()).unwrap_or("download");
-        resolve_local_path(client.get_current_local_path(), filename)
+        resolve_local_path(&client.session.current_local_path, filename)
     }
 }
 
 fn resolve_local_dest(client: &BaiduApiClient, src: &str, dest_arg: &str) -> String {
     if dest_arg.ends_with('/') {
-        let dir = resolve_local_path(client.get_current_local_path(), dest_arg);
+        let dir = resolve_local_path(&client.session.current_local_path, dest_arg);
         let name = Path::new(src).file_name().and_then(|n| n.to_str()).unwrap_or("untitled");
         format!("{}/{}", dir, name)
     } else {
-        resolve_local_path(client.get_current_local_path(), dest_arg)
+        resolve_local_path(&client.session.current_local_path, dest_arg)
     }
 }
 
@@ -797,4 +856,54 @@ pub fn handle_config_command(mut config: Config, args: &[String]) -> anyhow::Res
         }
     }
     Ok(())
+}
+
+/// Shell 风格的行解析：支持单引号、双引号、反斜杠转义
+#[allow(clippy::while_let_on_iterator)]
+fn shell_split(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            ' ' | '\t' => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            '\'' => {
+                while let Some(ch) = chars.next() {
+                    if ch == '\'' {
+                        break;
+                    }
+                    current.push(ch);
+                }
+            }
+            '"' => {
+                while let Some(ch) = chars.next() {
+                    if ch == '"' {
+                        break;
+                    }
+                    if ch == '\\' {
+                        if let Some(next) = chars.next() {
+                            current.push(next);
+                        }
+                    } else {
+                        current.push(ch);
+                    }
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }

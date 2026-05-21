@@ -14,8 +14,22 @@ use std::{
 
 use crate::constants::*;
 use crate::display::format_size;
+use crate::error::BftpError;
 use crate::models::*;
 use crate::session::Session;
+
+pub type MsgCallback = dyn Fn(&str) + Send + Sync;
+
+pub fn new_progress_bar(file_size: u64, message: &str) -> ProgressBar {
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n{wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
+            .unwrap()
+    );
+    pb.set_message(message.to_string());
+    pb
+}
 
 /// 下载策略
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +50,7 @@ impl DownloadOptions {
 /// 百度网盘API客户端
 pub struct BaiduApiClient {
     client: Client,
-    session: Session,
+    pub session: Session,
 }
 
 impl BaiduApiClient {
@@ -49,32 +63,6 @@ impl BaiduApiClient {
             client,
             session: Session::new(access_token),
         }
-    }
-
-    // ---- Session 访问 ----
-
-    pub fn session(&self) -> &Session {
-        &self.session
-    }
-
-    pub fn session_mut(&mut self) -> &mut Session {
-        &mut self.session
-    }
-
-    pub fn get_current_remote_path(&self) -> &str {
-        &self.session.current_remote_path
-    }
-
-    pub fn get_current_local_path(&self) -> &str {
-        &self.session.current_local_path
-    }
-
-    pub fn set_current_remote_path(&mut self, path: String) {
-        self.session.current_remote_path = path;
-    }
-
-    pub fn set_current_local_path(&mut self, path: String) {
-        self.session.current_local_path = path;
     }
 
     // ---- API 方法 ----
@@ -99,7 +87,11 @@ impl BaiduApiClient {
 
     fn check<T: ApiResponse>(result: T, context: &str) -> anyhow::Result<T> {
         if !result.is_success() {
-            return Err(anyhow!("{}: {}", context, result.error_desc()));
+            let api_err = BftpError::Api {
+                errno: result.error_code(),
+                errmsg: result.error_msg(),
+            };
+            return Err(anyhow::Error::from(api_err).context(context.to_string()));
         }
         Ok(result)
     }
@@ -194,7 +186,7 @@ impl BaiduApiClient {
     }
 
     /// 通过 dlink 下载文件（单线程），返回新下载的字节数
-    pub async fn download_from_url(&self, dlink: &str, local_path: &str, file_size: u64, resume: u64) -> anyhow::Result<u64> {
+    pub async fn download_from_url(&self, dlink: &str, local_path: &str, _file_size: u64, resume: u64, pb: Option<ProgressBar>) -> anyhow::Result<u64> {
         let url = format!("{}&access_token={}", dlink, self.session.access_token);
         let mut req = self.client.get(&url)
             .header("User-Agent", USER_AGENT);
@@ -213,14 +205,9 @@ impl BaiduApiClient {
             std::fs::create_dir_all(parent)?;
         }
 
-        let pb = ProgressBar::new(file_size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{msg}\n{wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .unwrap()
-        );
-        pb.set_message(local_path.to_string());
-        if resume > 0 {
+        if let Some(ref pb) = pb
+            && resume > 0
+        {
             pb.set_position(resume);
         }
 
@@ -233,9 +220,13 @@ impl BaiduApiClient {
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
             downloaded += chunk.len() as u64;
-            pb.set_position(downloaded);
+            if let Some(ref pb) = pb {
+                pb.set_position(downloaded);
+            }
         }
-        pb.finish_and_clear();
+        if let Some(ref pb) = pb {
+            pb.finish_and_clear();
+        }
 
         Ok(downloaded - resume)
     }
@@ -248,9 +239,10 @@ impl BaiduApiClient {
         file_size: u64,
         num_threads: usize,
         resume: u64,
+        pb: Option<ProgressBar>,
     ) -> anyhow::Result<u64> {
         if num_threads <= 1 || file_size.saturating_sub(resume) < MULTITHREAD_MIN_SIZE {
-            return self.download_from_url(dlink, local_path, file_size, resume).await;
+            return self.download_from_url(dlink, local_path, file_size, resume, pb).await;
         }
 
         let url = format!("{}&access_token={}", dlink, self.session.access_token);
@@ -269,14 +261,10 @@ impl BaiduApiClient {
         let total = Arc::new(AtomicU64::new(resume));
         File::create(&progress_path)?.write_at(&resume.to_le_bytes(), 0)?;
 
-        let pb = Arc::new(ProgressBar::new(file_size));
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{msg}\n{wide_bar} {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")
-                .unwrap()
-        );
-        pb.set_message(local_path.to_string());
-        if resume > 0 {
+        let pb = pb.map(Arc::new);
+        if let Some(ref pb) = pb
+            && resume > 0
+        {
             pb.set_position(resume);
         }
 
@@ -317,7 +305,9 @@ impl BaiduApiClient {
                 while let Some(chunk) = response.chunk().await? {
                     file.write_at(&chunk, offset)?;
                     offset += chunk.len() as u64;
-                    pb.inc(chunk.len() as u64);
+                    if let Some(ref pb) = pb {
+                        pb.inc(chunk.len() as u64);
+                    }
                     let n = total.fetch_add(chunk.len() as u64, Ordering::Relaxed) + chunk.len() as u64;
                     if let Ok(pf) = OpenOptions::new().write(true).open(&progress_path) {
                         pf.write_at(&n.to_le_bytes(), 0)?;
@@ -332,7 +322,9 @@ impl BaiduApiClient {
             let size = handle.await.context("分片任务失败")??;
             downloaded += size;
         }
-        pb.finish_and_clear();
+        if let Some(ref pb) = pb {
+            pb.finish_and_clear();
+        }
         std::fs::remove_file(&progress_path).ok();
 
         Ok(downloaded)
@@ -345,11 +337,12 @@ impl BaiduApiClient {
         local_path: &str,
         file_size: u64,
         opts: DownloadOptions,
+        pb: Option<ProgressBar>,
     ) -> anyhow::Result<u64> {
         if opts.num_threads <= 1 || file_size.saturating_sub(opts.resume) < MULTITHREAD_MIN_SIZE {
-            self.download_from_url(dlink, local_path, file_size, opts.resume).await
+            self.download_from_url(dlink, local_path, file_size, opts.resume, pb).await
         } else {
-            self.download_from_url_multithreaded(dlink, local_path, file_size, opts.num_threads, opts.resume).await
+            self.download_from_url_multithreaded(dlink, local_path, file_size, opts.num_threads, opts.resume, pb).await
         }
     }
 
@@ -382,7 +375,8 @@ impl BaiduApiClient {
         let mut opts = opts;
         opts.resume = resume;
 
-        let new_bytes = self.download_from_url_auto(&file_meta.dlink, local_path, file_size, opts).await?;
+        let pb = new_progress_bar(file_size, local_path);
+        let new_bytes = self.download_from_url_auto(&file_meta.dlink, local_path, file_size, opts, Some(pb)).await?;
         let total = resume + new_bytes;
         if resume > 0 {
             println!("下载完成: {} {} (续传 {})", local_path, format_size(total), format_size(resume));
@@ -461,7 +455,8 @@ impl BaiduApiClient {
             let metas = self.get_file_metas(&[file_info.fs_id]).await?;
             let file_meta = metas.list.first()
                 .ok_or_else(|| anyhow!("获取下载链接失败"))?;
-            self.download_from_url_auto(&file_meta.dlink, lp, file_info.size, file_opts).await?;
+            let pb = new_progress_bar(file_info.size, lp);
+            self.download_from_url_auto(&file_meta.dlink, lp, file_info.size, file_opts, Some(pb)).await?;
             downloaded += 1;
         }
 
@@ -471,12 +466,15 @@ impl BaiduApiClient {
 
     // ---- 上传 ----
 
-    pub async fn precreate(&self, path: &str, size: u64, block_list: &str) -> anyhow::Result<PrecreateResponse> {
+    pub async fn precreate(&self, path: &str, size: u64, block_list: &str, uploadid: Option<&str>) -> anyhow::Result<PrecreateResponse> {
         let url = self.api_url("/xpan/file?method=precreate");
-        let body = format!(
+        let mut body = format!(
             "path={}&size={}&isdir=0&block_list={}&autoinit=1&rtype=1",
             urlencoding::encode(path), size, urlencoding::encode(block_list),
         );
+        if let Some(uid) = uploadid {
+            body.push_str(&format!("&uploadid={}", urlencoding::encode(uid)));
+        }
         let result: PrecreateResponse = self.post_form(&url, body).await?;
         Self::check(result, "预上传失败")
     }
@@ -484,8 +482,8 @@ impl BaiduApiClient {
     pub async fn locate_upload(&self, path: &str, uploadid: &str) -> anyhow::Result<String> {
         let encoded_path = urlencoding::encode(path);
         let url = format!(
-            "{}/file?method=locateupload&appid=250528&access_token={}&path={}&uploadid={}&upload_version=2.0",
-            D_PCS_BAIDU_BASE, self.session.access_token, encoded_path, uploadid
+            "{}/file?method=locateupload&appid={}&access_token={}&path={}&uploadid={}&upload_version={}",
+            D_PCS_BAIDU_BASE, APP_ID, self.session.access_token, encoded_path, uploadid, UPLOAD_VERSION
         );
         let result: LocateUploadResponse = self.get_json(&url).await?;
         let result = Self::check(result, "获取上传域名失败")?;
@@ -507,8 +505,8 @@ impl BaiduApiClient {
     ) -> anyhow::Result<String> {
         let encoded_path = urlencoding::encode(path);
         let url = format!(
-            "{}/rest/2.0/pcs/superfile2?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
-            domain, self.session.access_token, encoded_path, uploadid, partseq
+            "{}{}?method=upload&access_token={}&type=tmpfile&path={}&uploadid={}&partseq={}",
+            domain, PCS_UPLOAD_PATH, self.session.access_token, encoded_path, uploadid, partseq
         );
 
         let part = reqwest::multipart::Part::bytes(data)
@@ -544,7 +542,7 @@ impl BaiduApiClient {
         Self::check(result, "创建文件失败")
     }
 
-    pub async fn upload_file(&self, local_path: &str, remote_filename: Option<&str>) -> anyhow::Result<()> {
+    pub async fn upload_file(&self, local_path: &str, remote_filename: Option<&str>, on_msg: Option<&MsgCallback>) -> anyhow::Result<()> {
         let local_file_path = Path::new(local_path);
         if !local_file_path.exists() {
             return Err(anyhow!("本地文件不存在: {}", local_path));
@@ -563,38 +561,64 @@ impl BaiduApiClient {
             format!("{}/{}", self.session.current_remote_path, filename)
         };
 
-        println!("上传文件: {} -> {}", local_path, remote_path);
+        let msg = |s: &str| {
+            if let Some(cb) = on_msg {
+                cb(s);
+            }
+        };
+
+        msg(&format!("上传文件: {} -> {}", local_path, remote_path));
 
         let (file_size, block_list, chunk_count) = compute_block_list(local_path)?;
-        println!("文件大小: {}, 分片数: {}", format_size(file_size), chunk_count);
+        msg(&format!("文件大小: {}, 分片数: {}", format_size(file_size), chunk_count));
 
-        println!("[1/3] 预上传...");
-        let precreate_result = self.precreate(&remote_path, file_size, &block_list).await?;
+        // 读取上传断点进度
+        let progress_path = format!("{}.bftp_upload", local_path);
+        let (saved_uploadid, saved_chunks) = read_upload_progress(&progress_path);
+
+        let resume_info = if saved_chunks.is_empty() {
+            String::new()
+        } else {
+            format!("（续传，已完成 {}/{} 分片）", saved_chunks.len(), chunk_count)
+        };
+
+        msg(&format!("[1/3] 预上传...{}", resume_info));
+        let precreate_result = self.precreate(&remote_path, file_size, &block_list, saved_uploadid.as_deref()).await?;
         let uploadid = precreate_result.uploadid.context("预上传未返回uploadid")?;
         let chunks_to_upload = precreate_result.block_list.unwrap_or_else(|| vec![0]);
-        println!("uploadid: {}", uploadid);
+        msg(&format!("uploadid: {}", uploadid));
 
-        println!("[2/3] 获取上传域名...");
+        // 保存/更新 uploadid
+        save_upload_progress(&progress_path, &uploadid, &[])?;
+
+        msg("[2/3] 获取上传域名...");
         let domain = self.locate_upload(&remote_path, &uploadid).await?;
-        println!("上传域名: {}", domain);
+        msg(&format!("上传域名: {}", domain));
 
         let total_chunks = chunks_to_upload.len();
+        if total_chunks == 0 {
+            msg("所有分片已上传，跳过上传步骤");
+        }
         for (i, &chunk_idx) in chunks_to_upload.iter().enumerate() {
             let progress = format!("{}/{}", i + 1, total_chunks);
-            println!("[2/3] 上传分片 {} (index={})...", progress, chunk_idx);
+            msg(&format!("[2/3] 上传分片 {} (index={})...", progress, chunk_idx));
             let chunk_data = read_chunk(local_path, chunk_idx as usize)?;
             let chunk_md5 = self.upload_chunk(&domain, &remote_path, &uploadid, chunk_idx, chunk_data).await?;
-            println!("  分片 {} md5: {}", chunk_idx, chunk_md5);
+            msg(&format!("  分片 {} md5: {}", chunk_idx, chunk_md5));
+            // 记录已完成的分片
+            append_completed_chunk(&progress_path, chunk_idx)?;
         }
 
-        println!("[3/3] 创建文件...");
+        msg("[3/3] 创建文件...");
         let result = self.create_file(&remote_path, file_size, &block_list, &uploadid).await?;
-        println!("上传成功!");
-        println!("  文件名: {}", result.server_filename.as_deref().unwrap_or(filename));
-        println!("  路径: {}", result.path.as_deref().unwrap_or(&remote_path));
-        println!("  大小: {}", format_size(result.size.unwrap_or(file_size)));
-        println!("  fs_id: {}", result.fs_id.unwrap_or(0));
+        msg("上传成功!");
+        msg(&format!("  文件名: {}", result.server_filename.as_deref().unwrap_or(filename)));
+        msg(&format!("  路径: {}", result.path.as_deref().unwrap_or(&remote_path)));
+        msg(&format!("  大小: {}", format_size(result.size.unwrap_or(file_size))));
+        msg(&format!("  fs_id: {}", result.fs_id.unwrap_or(0)));
 
+        // 清理断点文件
+        std::fs::remove_file(&progress_path).ok();
         Ok(())
     }
 
@@ -760,4 +784,32 @@ fn check_resume(local_path: &str, remote_size: u64) -> u64 {
         }
         _ => 0,
     }
+}
+
+fn read_upload_progress(progress_path: &str) -> (Option<String>, Vec<i32>) {
+    let content = match std::fs::read_to_string(progress_path) {
+        Ok(c) => c,
+        Err(_) => return (None, Vec::new()),
+    };
+    let mut lines = content.lines();
+    let uploadid = lines.next().map(|s| s.to_string());
+    let chunks: Vec<i32> = lines
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    (uploadid, chunks)
+}
+
+fn save_upload_progress(progress_path: &str, uploadid: &str, _chunks: &[i32]) -> anyhow::Result<()> {
+    if let Some(parent) = Path::new(progress_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(progress_path, format!("{}\n", uploadid))?;
+    Ok(())
+}
+
+fn append_completed_chunk(progress_path: &str, chunk_idx: i32) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = OpenOptions::new().append(true).open(progress_path)?;
+    writeln!(file, "{}", chunk_idx)?;
+    Ok(())
 }

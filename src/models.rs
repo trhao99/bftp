@@ -6,6 +6,8 @@ use std::hash::Hash;
 pub trait ApiResponse {
     fn is_success(&self) -> bool;
     fn error_desc(&self) -> String;
+    fn error_code(&self) -> i32 { 0 }
+    fn error_msg(&self) -> Option<String> { None }
 }
 
 /// 百度网盘API响应通用结构
@@ -22,6 +24,8 @@ impl ApiResponse for BaiduApiErrNoResponse {
     fn error_desc(&self) -> String {
         format!("errno={}, msg={:?}", self.errno, self.errmsg)
     }
+    fn error_code(&self) -> i32 { self.errno }
+    fn error_msg(&self) -> Option<String> { self.errmsg.clone() }
 }
 
 /// 用户信息响应
@@ -55,6 +59,7 @@ pub struct CapacityInfoResponse {
 impl ApiResponse for CapacityInfoResponse {
     fn is_success(&self) -> bool { self.errno == 0 }
     fn error_desc(&self) -> String { format!("errno={}", self.errno) }
+    fn error_code(&self) -> i32 { self.errno }
 }
 
 /// 文件列表响应
@@ -138,10 +143,10 @@ pub struct FileMeta {
     pub category: FileType,
     pub dlink: String,
     pub filename: String,
-    pub isdir: i32,
-    pub server_ctime: i32,
-    pub server_mtime: i32,
-    pub size: i32,
+    pub isdir: u32,
+    pub server_ctime: u64,
+    pub server_mtime: u64,
+    pub size: u64,
     pub thumbs: Option<HashMap<String, String>>,
     pub height: Option<i32>,
     pub width: Option<i32>,
@@ -222,6 +227,8 @@ pub struct SearchFileBySemanticResponse {
 impl ApiResponse for SearchFileBySemanticResponse {
     fn is_success(&self) -> bool { self.error_no == 0 }
     fn error_desc(&self) -> String { format!("error_no={}, msg={:?}", self.error_no, self.error_msg) }
+    fn error_code(&self) -> i32 { self.error_no }
+    fn error_msg(&self) -> Option<String> { self.error_msg.clone() }
 }
 
 /// 文件管理响应
@@ -281,6 +288,8 @@ pub struct LocateUploadResponse {
 impl ApiResponse for LocateUploadResponse {
     fn is_success(&self) -> bool { self.error_code == 0 }
     fn error_desc(&self) -> String { format!("error_code={}, msg={:?}", self.error_code, self.error_msg) }
+    fn error_code(&self) -> i32 { self.error_code }
+    fn error_msg(&self) -> Option<String> { self.error_msg.clone() }
 }
 
 /// 分片上传响应
@@ -298,6 +307,7 @@ impl ApiResponse for UploadChunkResponse {
     fn error_desc(&self) -> String {
         format!("errno={:?}", self.errno)
     }
+    fn error_code(&self) -> i32 { self.errno.unwrap_or(0) }
 }
 
 /// 创建文件响应

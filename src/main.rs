@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         let prompt = format!(
             "\x1b[1;36m{}\x1b[0m:\x1b[1;32m{}\x1b[0m> ",
             username,
-            client.get_current_remote_path()
+            &client.session.current_remote_path
         );
         let readline = rl.readline(&prompt);
         match readline {

@@ -114,47 +114,25 @@ pub fn format_size(size: u64) -> String {
 /// 格式化时间戳为可读形式 (MM-dd HH:mm)
 pub fn format_timestamp(timestamp: u64) -> String {
     let secs = timestamp as i64;
-    let days_since_epoch = secs / 86400;
+    let days = secs / 86400;
     let time_in_day = secs % 86400;
-
     let hours = time_in_day / 3600;
     let minutes = (time_in_day % 3600) / 60;
 
-    // 粗略计算月份和日期（从1970-01-01开始）
-    let mut remaining_days = days_since_epoch;
-    let mut year = 1970i64;
-    let mut month = 1u32;
-
-    loop {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days >= days_in_year {
-            remaining_days -= days_in_year;
-            year += 1;
-        } else {
-            break;
-        }
-    }
-
-    let days_in_months = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    for (i, &days) in days_in_months.iter().enumerate() {
-        if remaining_days >= days {
-            remaining_days -= days;
-        } else {
-            month = (i + 1) as u32;
-            break;
-        }
-    }
-
-    let day = (remaining_days + 1) as u32;
-
+    let (month, day) = month_day_from_days(days);
     format!("{:02}-{:02} {:02}:{:02}", month, day, hours, minutes)
 }
 
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+/// Howard Hinnant's civil_from_days algorithm: days since 1970-01-01 → (month, day).
+fn month_day_from_days(days: i64) -> (u32, u32) {
+    // Shift epoch from 1970-01-01 to 0000-03-01
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (m, d)
 }

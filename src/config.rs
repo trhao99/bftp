@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::constants::OAUTH_SCOPE;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserToken {
     #[serde(default)]
@@ -23,7 +25,7 @@ impl Default for Config {
         Self {
             client_id: String::new(),
             redirect_uri: "oob".to_string(),
-            scope: "basic,netdisk".to_string(),
+            scope: OAUTH_SCOPE.to_string(),
             default: "default_user".to_string(),
             users: HashMap::new(),
         }

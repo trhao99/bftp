@@ -4,6 +4,7 @@ use std::io::{self, Write};
 
 use crate::client::BaiduApiClient;
 use crate::config::Config;
+use crate::constants::OAUTH_SCOPE;
 
 /// 从回调URL片段中提取access_token
 fn extract_access_token(callback_url: &str) -> anyhow::Result<String> {
@@ -34,8 +35,8 @@ pub async fn start_implicit_grant_flow(
 
     // 构建授权URL
     let auth_url = format!(
-        "https://openapi.baidu.com/oauth/2.0/authorize?response_type=token&client_id={}&redirect_uri={}&scope=basic,netdisk",
-        client_id, redirect_uri
+        "https://openapi.baidu.com/oauth/2.0/authorize?response_type=token&client_id={}&redirect_uri={}&scope={}",
+        client_id, redirect_uri, OAUTH_SCOPE
     );
 
     println!("\n1. 请在浏览器中打开以下URL：");
