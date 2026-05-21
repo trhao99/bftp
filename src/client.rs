@@ -577,9 +577,9 @@ impl BaiduApiClient {
         }
         let new_bytes = self.download_from_url(dlink, local_path, file_info.size, resume).await?;
         if resume > 0 {
-            println!("下载完成: {} (续传 {})", format_size(resume + new_bytes), format_size(resume));
+            println!("下载完成: {} {} (续传 {})", local_path, format_size(resume + new_bytes), format_size(resume));
         } else {
-            println!("下载成功: {} ({} 已写入)", format_size(file_info.size), format_size(new_bytes));
+            println!("下载成功: {} ({} 已写入)", local_path, format_size(new_bytes));
         }
         Ok(())
     }
@@ -659,9 +659,9 @@ impl BaiduApiClient {
         ).await?;
         let total = resume + new_bytes;
         if resume > 0 {
-            println!("下载完成: {} (续传 {})", format_size(total), format_size(resume));
+            println!("下载完成: {} {} (续传 {})", local_path, format_size(total), format_size(resume));
         } else {
-            println!("下载成功: {} ({} 已写入)", format_size(total), format_size(new_bytes));
+            println!("下载成功: {} ({} 已写入)", local_path, format_size(new_bytes));
         }
         Ok(())
     }

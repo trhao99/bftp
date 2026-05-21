@@ -46,21 +46,21 @@ const HELP_TEXT: &str = "\
   rename <文件> <新名>  重命名远程文件
   mv <源> <目标>    移动远程文件
   cp <源> <目标>    复制远程文件
-  rm <文件>         删除远程文件
+  rm <文件>         删除远程文件（支持通配符: rm *.txt）
 
 \x1b[1m本地文件操作:\x1b[0m
   lmkdir <目录>     创建本地目录
   lmv <源> <目标>   移动本地文件
   lcp <源> <目标>   复制本地文件
-  lrm <文件>        删除本地文件
+  lrm <文件>        删除本地文件（支持通配符: lrm *.tmp）
 
 \x1b[1m文件传输:\x1b[0m
-  put <本地文件> [远程名]    上传文件
-  get <远程文件> [本地路径]  下载文件
-  get -r <远程目录> [本地]   递归下载目录
-  mget <远程文件> [本地路径] 多线程下载文件（默认4线程）
+  put <本地文件> [远程名]    上传文件（支持通配符: put *.txt）
+  get <远程文件> [本地路径]  下载文件（支持通配符: get *.txt）
+  get -r <远程目录> [本地]   递归下载目录（支持通配符: get -r dir*）
+  mget <远程文件> [本地路径] 多线程下载文件（默认4线程，支持通配符）
   mget -t N <远程文件> [本地] 多线程下载（N线程）
-  mget -r <远程目录> [本地]  多线程递归下载目录
+  mget -r <远程目录> [本地]  多线程递归下载目录（支持通配符）
 
 \x1b[1m文件搜索:\x1b[0m
   search <关键字> [-r] [目录]     关键字搜索
@@ -358,21 +358,51 @@ pub async fn execute_command(
         "put" => {
             if parts.len() < 2 {
                 eprintln!("用法: put <本地文件> [远程文件名]");
+                eprintln!("支持通配符: put *.txt");
                 return;
             }
-            let local_path = resolve_local_path(client.get_current_local_path(), parts[1]);
-            let remote_filename = if parts.len() > 2 {
-                Some(parts[2])
+            if has_wildcards(parts[1]) {
+                if parts.len() > 2 {
+                    eprintln!("通配符模式不支持指定远程文件名");
+                    return;
+                }
+                let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_local_path(), false);
+                match expand_local_wildcard_files(&dir, &pattern) {
+                    Ok(files) => {
+                        if files.is_empty() {
+                            println!("没有匹配的文件: {}", parts[1]);
+                            return;
+                        }
+                        println!("匹配到 {} 个文件", files.len());
+                        for local_file in &files {
+                            let name = Path::new(local_file)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("unknown");
+                            println!("上传: {} -> {}/{}", name, client.get_current_remote_path(), name);
+                            if let Err(e) = client.upload_file(local_file, None).await {
+                                eprintln!("上传 {} 失败: {}", local_file, e);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("展开通配符失败: {}", e),
+                }
             } else {
-                None
-            };
-            if let Err(e) = client.upload_file(&local_path, remote_filename).await {
-                eprintln!("上传失败: {}", e);
+                let local_path = resolve_local_path(client.get_current_local_path(), parts[1]);
+                let remote_filename = if parts.len() > 2 {
+                    Some(parts[2])
+                } else {
+                    None
+                };
+                if let Err(e) = client.upload_file(&local_path, remote_filename).await {
+                    eprintln!("上传失败: {}", e);
+                }
             }
         }
         "get" => {
             if parts.len() < 2 {
                 eprintln!("用法: get [-r] <远程文件> [本地路径]");
+                eprintln!("支持通配符: get *.txt  /  get -r dir*");
                 return;
             }
             if parts[1] == "-r" {
@@ -380,18 +410,73 @@ pub async fn execute_command(
                     eprintln!("用法: get -r <远程目录> [本地目录]");
                     return;
                 }
-                let remote_dir = normalize_path(client.get_current_remote_path(), parts[2]);
-                let local_dir = if parts.len() > 3 {
-                    resolve_local_path(client.get_current_local_path(), parts[3])
+                if has_wildcards(parts[2]) {
+                    let (dir, pattern) = parse_wildcard_path(parts[2], client.get_current_remote_path(), true);
+                    let local_base = if parts.len() > 3 {
+                        resolve_local_path(client.get_current_local_path(), parts[3])
+                    } else {
+                        client.get_current_local_path().to_string()
+                    };
+                    match expand_remote_wildcard_files(client, &dir, &pattern, true).await {
+                        Ok(paths) => {
+                            if paths.is_empty() {
+                                println!("没有匹配的目录: {}", parts[2]);
+                                return;
+                            }
+                            for remote_path in &paths {
+                                let dirname = Path::new(remote_path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("download");
+                                let local_dir = format!("{}/{}", local_base, dirname);
+                                if let Err(e) = client.download_dir(remote_path, &local_dir).await {
+                                    eprintln!("下载 {} 失败: {}", remote_path, e);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("展开通配符失败: {}", e),
+                    }
                 } else {
-                    let dirname = Path::new(&remote_dir)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("download");
-                    resolve_local_path(client.get_current_local_path(), dirname)
+                    let remote_dir = normalize_path(client.get_current_remote_path(), parts[2]);
+                    let local_dir = if parts.len() > 3 {
+                        resolve_local_path(client.get_current_local_path(), parts[3])
+                    } else {
+                        let dirname = Path::new(&remote_dir)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("download");
+                        resolve_local_path(client.get_current_local_path(), dirname)
+                    };
+                    if let Err(e) = client.download_dir(&remote_dir, &local_dir).await {
+                        eprintln!("下载失败: {}", e);
+                    }
+                }
+            } else if has_wildcards(parts[1]) {
+                let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_remote_path(), true);
+                let local_dir = if parts.len() > 2 {
+                    resolve_local_path(client.get_current_local_path(), parts[2])
+                } else {
+                    client.get_current_local_path().to_string()
                 };
-                if let Err(e) = client.download_dir(&remote_dir, &local_dir).await {
-                    eprintln!("下载失败: {}", e);
+                match expand_remote_wildcard_files(client, &dir, &pattern, false).await {
+                    Ok(paths) => {
+                        if paths.is_empty() {
+                            println!("没有匹配的文件: {}", parts[1]);
+                            return;
+                        }
+                        println!("匹配到 {} 个文件", paths.len());
+                        for remote_path in &paths {
+                            let filename = Path::new(remote_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("download");
+                            let local_path = format!("{}/{}", local_dir, filename);
+                            if let Err(e) = client.download_file(remote_path, &local_path).await {
+                                eprintln!("下载 {} 失败: {}", remote_path, e);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("展开通配符失败: {}", e),
                 }
             } else {
                 let remote_path = normalize_path(client.get_current_remote_path(), parts[1]);
@@ -412,6 +497,7 @@ pub async fn execute_command(
         "mget" => {
             if parts.len() < 2 {
                 eprintln!("用法: mget [-r] [-t 线程数] <远程文件> [本地路径]");
+                eprintln!("支持通配符: mget *.txt  /  mget -r dir*");
                 return;
             }
             let mut recursive = false;
@@ -442,7 +528,40 @@ pub async fn execute_command(
                 return;
             }
 
-            if recursive {
+            if has_wildcards(parts[args_start]) {
+                let (dir, pattern) = parse_wildcard_path(parts[args_start], client.get_current_remote_path(), true);
+                let local_base = if args_start + 1 < parts.len() {
+                    resolve_local_path(client.get_current_local_path(), parts[args_start + 1])
+                } else {
+                    client.get_current_local_path().to_string()
+                };
+                match expand_remote_wildcard_files(client, &dir, &pattern, recursive).await {
+                    Ok(paths) => {
+                        if paths.is_empty() {
+                            println!("没有匹配的{}: {}", if recursive { "目录" } else { "文件" }, parts[args_start]);
+                            return;
+                        }
+                        println!("匹配到 {} 个{}", paths.len(), if recursive { "目录" } else { "文件" });
+                        for remote_path in &paths {
+                            let name = Path::new(remote_path)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("download");
+                            let local_path = format!("{}/{}", local_base, name);
+                            if recursive {
+                                if let Err(e) = client.download_dir_mt(remote_path, &local_path, num_threads).await {
+                                    eprintln!("下载 {} 失败: {}", remote_path, e);
+                                }
+                            } else {
+                                if let Err(e) = client.download_file_mt(remote_path, &local_path, num_threads).await {
+                                    eprintln!("下载 {} 失败: {}", remote_path, e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("展开通配符失败: {}", e),
+                }
+            } else if recursive {
                 let remote_dir = normalize_path(client.get_current_remote_path(), parts[args_start]);
                 let local_dir = if args_start + 1 < parts.len() {
                     resolve_local_path(client.get_current_local_path(), parts[args_start + 1])
@@ -534,17 +653,46 @@ pub async fn execute_command(
         "rm" => {
             if parts.len() < 2 {
                 eprintln!("用法: rm <远程文件>");
+                eprintln!("支持通配符: rm *.txt");
                 return;
             }
-            let path = normalize_path(client.get_current_remote_path(), parts[1]);
-            if !confirm_delete(&path) {
-                println!("已取消");
-                return;
-            }
-            if let Err(e) = client.delete_file(&path).await {
-                eprintln!("删除失败: {}", e);
+            if has_wildcards(parts[1]) {
+                let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_remote_path(), true);
+                match expand_remote_wildcard_files(client, &dir, &pattern, false).await {
+                    Ok(paths) => {
+                        if paths.is_empty() {
+                            println!("没有匹配的文件: {}", parts[1]);
+                            return;
+                        }
+                        println!("匹配到 {} 个文件:", paths.len());
+                        for p in &paths {
+                            println!("  {}", p);
+                        }
+                        if !confirm_delete_batch(paths.len()) {
+                            println!("已取消");
+                            return;
+                        }
+                        for path in &paths {
+                            if let Err(e) = client.delete_file(path).await {
+                                eprintln!("删除 {} 失败: {}", path, e);
+                            } else {
+                                println!("删除成功: {}", path);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("展开通配符失败: {}", e),
+                }
             } else {
-                println!("删除成功: {}", path);
+                let path = normalize_path(client.get_current_remote_path(), parts[1]);
+                if !confirm_delete(&path) {
+                    println!("已取消");
+                    return;
+                }
+                if let Err(e) = client.delete_file(&path).await {
+                    eprintln!("删除失败: {}", e);
+                } else {
+                    println!("删除成功: {}", path);
+                }
             }
         }
         "lcp" => {
@@ -604,17 +752,46 @@ pub async fn execute_command(
         "lrm" => {
             if parts.len() < 2 {
                 eprintln!("用法: lrm <本地文件>");
+                eprintln!("支持通配符: lrm *.txt");
                 return;
             }
-            let path = resolve_local_path(client.get_current_local_path(), parts[1]);
-            if !confirm_delete(&path) {
-                println!("已取消");
-                return;
-            }
-            if let Err(e) = fs::remove_file(&path) {
-                eprintln!("删除失败: {}", e);
+            if has_wildcards(parts[1]) {
+                let (dir, pattern) = parse_wildcard_path(parts[1], client.get_current_local_path(), false);
+                match expand_local_wildcard_files(&dir, &pattern) {
+                    Ok(files) => {
+                        if files.is_empty() {
+                            println!("没有匹配的文件: {}", parts[1]);
+                            return;
+                        }
+                        println!("匹配到 {} 个文件:", files.len());
+                        for f in &files {
+                            println!("  {}", f);
+                        }
+                        if !confirm_delete_batch(files.len()) {
+                            println!("已取消");
+                            return;
+                        }
+                        for path in &files {
+                            if let Err(e) = fs::remove_file(path) {
+                                eprintln!("删除 {} 失败: {}", path, e);
+                            } else {
+                                println!("删除成功: {}", path);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("展开通配符失败: {}", e),
+                }
             } else {
-                println!("删除成功: {}", path);
+                let path = resolve_local_path(client.get_current_local_path(), parts[1]);
+                if !confirm_delete(&path) {
+                    println!("已取消");
+                    return;
+                }
+                if let Err(e) = fs::remove_file(&path) {
+                    eprintln!("删除失败: {}", e);
+                } else {
+                    println!("删除成功: {}", path);
+                }
             }
         }
         "clear" => {
@@ -721,6 +898,127 @@ fn confirm_delete(path: &str) -> bool {
     let mut input = String::new();
     io::stdin().read_line(&mut input).ok();
     matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// 批量删除确认，返回 true 表示确认
+fn confirm_delete_batch(count: usize) -> bool {
+    use std::io::{self, Write};
+    print!("确认删除以上 {} 个文件? (y/N): ", count);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
+/// 检查路径是否包含通配符
+fn has_wildcards(path: &str) -> bool {
+    path.contains('*') || path.contains('?') || path.contains('[')
+}
+
+/// 将 glob 通配符模式转换为正则表达式
+fn glob_to_regex(pattern: &str) -> String {
+    let mut re = String::from("^");
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '[' => {
+                re.push('[');
+                i += 1;
+                if i < chars.len() && (chars[i] == '!' || chars[i] == '^') {
+                    re.push('^');
+                    i += 1;
+                }
+                while i < chars.len() && chars[i] != ']' {
+                    re.push(chars[i]);
+                    i += 1;
+                }
+                if i < chars.len() {
+                    re.push(']');
+                }
+            }
+            '.' | '+' | '(' | ')' | '^' | '$' | '{' | '}' | '|' | '\\' => {
+                re.push('\\');
+                re.push(chars[i]);
+            }
+            c => re.push(c),
+        }
+        i += 1;
+    }
+    re.push('$');
+    re
+}
+
+/// 用 glob 模式匹配文件名
+fn glob_match(pattern: &str, name: &str) -> bool {
+    regex::Regex::new(&glob_to_regex(pattern))
+        .map(|r| r.is_match(name))
+        .unwrap_or(false)
+}
+
+/// 解析包含通配符的路径，返回 (目录, 模式)
+fn parse_wildcard_path(path: &str, current_dir: &str, is_remote: bool) -> (String, String) {
+    let first_wc = path.find(['*', '?', '[']).unwrap();
+    let dir_end = path[..first_wc].rfind('/').map(|i| i + 1).unwrap_or(0);
+    let dir_part = &path[..dir_end];
+    let pattern = &path[dir_end..];
+
+    let resolved_dir = if dir_part.is_empty() || dir_part == "." {
+        current_dir.to_string()
+    } else if dir_part.starts_with('/') {
+        if is_remote {
+            simplify_path(dir_part)
+        } else {
+            dir_part.to_string()
+        }
+    } else {
+        if is_remote {
+            normalize_path(current_dir, dir_part)
+        } else {
+            resolve_local_path(current_dir, dir_part)
+        }
+    };
+
+    (resolved_dir, pattern.to_string())
+}
+
+/// 展开本地通配符，返回匹配的文件完整路径列表
+fn expand_local_wildcard_files(dir: &str, pattern: &str) -> anyhow::Result<Vec<String>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if glob_match(pattern, &name) {
+            files.push(entry.path().to_string_lossy().to_string());
+        }
+    }
+    Ok(files)
+}
+
+/// 展开远程通配符，返回匹配的文件路径列表
+async fn expand_remote_wildcard_files(
+    client: &BaiduApiClient,
+    dir: &str,
+    pattern: &str,
+    dirs_only: bool,
+) -> anyhow::Result<Vec<String>> {
+    let file_list = client.list_files_in_dir(dir).await?;
+    let paths: Vec<String> = file_list
+        .list
+        .iter()
+        .flat_map(|l| l.iter())
+        .filter(|f| {
+            let type_ok = if dirs_only { f.isdir == 1 } else { f.isdir == 0 };
+            type_ok && glob_match(pattern, &f.server_filename)
+        })
+        .map(|f| f.path.clone())
+        .collect();
+    Ok(paths)
 }
 
 /// 解析本地文件路径（支持相对路径和绝对路径）

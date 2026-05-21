@@ -8,7 +8,7 @@ bftp 是一个用 Rust 编写的百度网盘交互式命令行工具，提供类
 
 - **FTP 风格交互界面** — `cd`、`ls`、`pwd` 等熟悉的命令，支持 Tab 补全和命令历史
 - **文件管理** — 支持远程和本地文件的创建、删除、重命名、移动、复制
-- **文件传输** — 支持上传和下载，下载支持多线程和断点续传
+- **文件传输** — 支持上传和下载（含通配符批量操作），下载支持多线程和断点续传
 - **文件搜索** — 支持关键字搜索和百度网盘语义搜索
 - **多用户切换** — 支持配置多个百度账号，快速切换
 - **远程 + 本地双面板** — 同时管理远程网盘和本地文件系统
@@ -67,6 +67,7 @@ exit / quit / bye                 # 退出程序
 ```bash
 put localfile                     # 上传单个文件到远程当前目录
 put localfile remotefile          # 上传并重命名
+put *.txt                         # 通配符：上传当前目录所有 .txt 文件
 ```
 
 ### 下载文件（远程 → 本地）
@@ -76,6 +77,8 @@ get remotefile                    # 下载单个文件到本地当前目录
 get remotefile localfile          # 下载并指定本地路径
 get -r remotedir                  # 递归下载整个目录到本地当前目录
 get -r remotedir localdir         # 递归下载到指定本地目录
+get *.txt                         # 通配符：下载当前目录所有 .txt 文件
+get -r dir*                       # 通配符：递归下载所有匹配的目录
 ```
 
 ### 多线程下载
@@ -84,6 +87,8 @@ get -r remotedir localdir         # 递归下载到指定本地目录
 mget remotefile [localfile]       # 多线程下载（默认 4 线程）
 mget -t N remotefile [localfile]  # 指定线程数下载
 mget -r remotedir [localdir]      # 多线程递归下载目录
+mget *.txt                        # 通配符：多线程下载所有匹配文件
+mget -r dir*                      # 通配符：多线程递归下载所有匹配目录
 ```
 
 ## 远程文件操作
@@ -122,4 +127,4 @@ lrm filename                      # 删除本地文件
 ## TODO
 
 1. [x] 多线程下载
-2. 命令支持通配符
+2. [x] 命令支持通配符（put / get / mget）
